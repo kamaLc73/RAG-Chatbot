@@ -1,0 +1,348 @@
+\documentclass[12pt,a4paper]{article}
+\usepackage[utf8]{inputenc}
+\usepackage[french]{babel}
+\usepackage[T1]{fontenc}
+\usepackage{geometry}
+\usepackage{fancyhdr}
+\usepackage{graphicx}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{hyperref}
+\usepackage{tcolorbox}
+\usepackage{amsmath}
+\usepackage{setspace} % Pour l'interligne 1.5
+\usepackage{mathptmx} % Pour la police Times New Roman
+\usepackage{titlesec} % Pour le formatage des titres
+\usepackage{tabularx} % Pour les tableaux de comparaison
+\usepackage{float}    % Pour forcer la position des images/tableaux avec [H]
+
+% --- Configuration de la page ---
+\geometry{margin=2.5cm, top=3cm, bottom=2.5cm}
+\onehalfspacing % Interligne 1,5 obligatoire pour le confort de lecture
+
+% --- Configuration des en-têtes et pieds de page ---
+\pagestyle{fancy}
+\fancyhf{}
+\fancyhead[L]{\small CDG}
+\fancyhead[C]{\small Chatbot RAG - RCAR/CNRA}
+\fancyhead[R]{\small Dehbi Kamal}
+\fancyfoot[C]{\thepage}
+\renewcommand{\headrulewidth}{0.5pt}
+
+% --- Configuration des titres (Normes: Hiérarchie claire 1. / 1.1. / 1.1.1. en gras) ---
+\definecolor{titlecolor}{RGB}{0, 102, 204} % Couleur des sections principales
+\definecolor{subtitlecolor}{RGB}{0, 153, 76} % Couleur des sous-sections
+
+% Application de la hiérarchie claire
+\titleformat{\section}{\color{titlecolor}\normalfont\Large\bfseries}{\thesection.}{1em}{}
+\titleformat{\subsection}{\color{subtitlecolor}\normalfont\large\bfseries}{\thesubsection.}{1em}{}
+\titleformat{\subsubsection}{\color{black}\normalfont\normalsize\bfseries}{\thesubsubsection.}{1em}{}
+
+% Redéfinir la numérotation logique
+\renewcommand{\thesection}{\arabic{section}}
+\renewcommand{\thesubsection}{\thesection.\arabic{subsection}}
+\renewcommand{\thesubsubsection}{\thesubsection.\arabic{subsubsection}}
+\setcounter{secnumdepth}{3}
+
+% Configuration des liens
+\hypersetup{
+    colorlinks=true,
+    linkcolor=blue,
+    urlcolor=blue
+}
+
+\begin{document}
+
+% ===================== PAGE DE GARDE =====================
+\begin{titlepage}
+    \begin{center}
+        % Logos at the top
+        \begin{minipage}{0.4\textwidth}
+            \begin{flushleft} \large
+                \includegraphics[width=0.8\textwidth]{logo_ensam.jpg}
+            \end{flushleft}
+        \end{minipage}
+        \hfill
+        \begin{minipage}{0.4\textwidth}
+            \begin{flushright} \large
+                \includegraphics[width=0.8\textwidth]{cdg_logo.png}
+            \end{flushright}
+        \end{minipage}
+
+        \vspace{2cm}
+
+        {\Large \textbf{Rapport d'Avancement et Benchmark}}\\[1cm]
+        {\huge \textbf{Architecture RAG pour un Chatbot Documentaire RCAR/CNRA}}\\[0.5cm]
+
+        \rule{\linewidth}{0.5mm}\\[1cm]
+
+        \vspace{1cm}
+
+        \begin{center}
+            \Large \textbf{Réalisé par :} Kamal Dehbi\\[0.5cm]
+            \Large \textbf{Encadré par :} M. El Mehdi Hilmi\\
+        \end{center}
+
+        % \vfill
+        \vspace{3cm}
+        \textbf{École nationale supérieure d'Arts et Métiers de Rabat
+        }\\[0.5cm]
+        \textbf{Filière : Ingénierie numérique en Data Science IA \& Big Data}\\[0.5cm]
+        \textbf{Année universitaire : 2025-2026}
+    \end{center}
+\end{titlepage}
+
+% ===================== DÉBUT DE PAGINATION =====================
+\pagenumbering{roman} % Chiffres romains (i, ii, iii...)
+
+\tableofcontents
+\newpage
+
+\phantomsection
+\addcontentsline{toc}{section}{\listfigurename}
+\listoffigures
+
+\vspace{1cm}
+
+\phantomsection
+\addcontentsline{toc}{section}{\listtablename}
+\listoftables
+\newpage
+
+\pagenumbering{arabic} % Chiffres arabes (1, 2, 3...) dès l'introduction
+\setcounter{page}{1}
+
+% ===================== CONTENU =====================
+
+\section{Introduction et Contexte du Projet}
+Ce projet vise à concevoir et implémenter un chatbot capable de répondre aux questions des utilisateurs à partir d’une base documentaire extraite des sites web institutionnels officiels :
+\begin{itemize}
+    \item \textbf{Caisse Nationale de Retraites et d'Assurances (CNRA) :} \url{https://www.cnra.ma/}
+    \item \textbf{Régime Collectif d'Allocation de Retraite (RCAR) :} \url{https://www.rcar.ma/}
+\end{itemize}
+
+Le système reposera sur une architecture Retrieval-Augmented Generation (RAG) permettant d’améliorer la pertinence des réponses en combinant recherche sémantique et génération par un Small Language Model (SLM) adapté à un contexte de déploiement en entreprise.
+
+Ce document présente une veille technologique et un benchmark des solutions possibles pour les différentes briques du système (vector store, modèles d’embeddings, SLM, etc.), en justifiant les choix recommandés.
+
+\section{Architecture Globale (Pipeline RAG)}
+Le pipeline RAG permet de combler les lacunes d'un LLM standard en ajoutant un outil de recherche documentaire. Le flux global de ce module est découpé en plusieurs blocs indispensables.
+
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=\textwidth]{img/global.png}
+    \caption{Architecture globale du Chatbot RAG}
+    \label{fig:architecture_globale}
+\end{figure}
+
+\subsection{Composantes de l'Architecture}
+L'architecture globale de la solution s'articule autour de trois pipelines principaux synchronisés :
+
+\textbf{1. Pipeline Offline (Préparation des Données) :}
+\begin{itemize}
+    \item \textbf{Web Crawling \& Extraction :} Navigation automatisée sur les sources web (RCAR/CNRA) pour l'extraction du texte et des métadonnées associées.
+    \item \textbf{Cleaning \& Chunking :} Nettoyage, dédoublonnage et découpage sémantique du texte en segments de taille gérable (Chunks).
+    \item \textbf{Embeddings \& Datastores :} Transformation des segments en vecteurs (Embeddings) et stockage hybride réparti sur trois axes : Base Vectorielle (Vector Store), Index Lexical (BM25 Index) et une base de métadonnées (Document Store).
+\end{itemize}
+
+\textbf{2. Pipeline Online (Chatbot RAG) :}
+\begin{itemize}
+    \item \textbf{Orchestration \& Reformulation :} L'API intercepte la requête utilisateur via l'interface de chat et la reformule au besoin pour optimiser la recherche.
+    \item \textbf{Recherche Hybride (Hybrid Retrieval) :} Interrogation simultanée de la base vectorielle (Sémantique) et de l'index BM25 (Mots-clés).
+    \item \textbf{Reranker :} Un modèle spécialisé réordonne les segments obtenus pour faire remonter les plus pertinents (Top-K) au sommet.
+    \item \textbf{Context Builder \& SLM :} Construction du contexte et génération de la réponse finale par le Small Language Model (SLM), incluant les citations exactes.
+\end{itemize}
+
+\textbf{3. Évaluation et Gouvernance :}
+\begin{itemize}
+    \item \textbf{Évaluation :} Mesure continue (Précision, Rappel, Fidélité, Latence) basée sur un ensemble de questions métier (Business Question Set).
+    \item \textbf{Monitoring :} Boucle de feedback reliant les réponses, l'orchestrateur et les logs pour améliorer le système de manière itérative.
+\end{itemize}
+
+\section{Veille Technologique et Benchmark}
+Cette section établit les différentes briques technologiques disponibles actuellement sur le marché et effectue un jugement comparatif pour isoler celles qui constituent le \textbf{meilleur choix (best fit)} pour un déploiement en entreprise.
+
+\subsection{Extraction de Données (Web Crawling)}
+La récupération et la structuration des données publiques (RCAR/CNRA) constituent la première étape du pipeline offline.
+
+\begin{table}[H]
+    \centering
+    \renewcommand{\arraystretch}{1.5}
+    \begin{tabularx}{\textwidth}{|X|X|X|}
+        \hline
+        \textbf{Outil} & \textbf{Avantages} & \textbf{Inconvénients} \\
+        \hline
+        \textbf{Scrapy} & Standard industriel, rapide, robuste pour gros volumes. & Bas niveau, nécessite du code complexe pour le nettoyage. \\
+        \hline
+        \textbf{BeautifulSoup / Selenium} & BeautifulSoup est simple à configurer ; Selenium gère le JavaScript. & Lent à grande échelle, parcours manuel des liens. \\
+        \hline
+        \textbf{Crawlee / Firecrawl} & Frameworks modernes IA, extrait en Markdown propre, gère bien le JS. & Communauté récente, peut être lourd à héberger. \\
+        \hline
+    \end{tabularx}
+    \caption{Benchmark des Web Crawlers}
+\end{table}
+
+\textbf{Le choix optimal : Crawlee} ou l'utilisation d'outils modernes orientés LLM (comme Firecrawl en setup local). Ils permettent d'obtenir un texte Markdown structuré et propre avec un minimum d'effort comparé aux classiques comme BeautifulSoup, facilitant considérablement la suite du pipeline.
+
+\subsection{Recherche Hybride et Reranking}
+Le passage d'un RAG classique à un système robuste s'effectue via l'introduction de l'indexation hybride (BM25 + Dense) et du Reranking (réordonnancement).
+
+\begin{table}[H]
+    \centering
+    \renewcommand{\arraystretch}{1.5}
+    \begin{tabularx}{\textwidth}{|X|X|X|}
+        \hline
+        \textbf{Méthode / Modèle} & \textbf{Avantages} & \textbf{Inconvénients} \\
+        \hline
+        \textbf{Cohere Rerank (API)} & Précision excellente, pionnier du secteur. & API commerciale, dépendance Cloud. \\
+        \hline
+        \textbf{BM25} & Ultra-rapide, idéal pour mots-clés exacts (ex: acronymes). & Ignore le sens global ou contextuel des phrases. \\
+        \hline
+        \textbf{BAAI/bge-reranker} & Leader open-source local, très bon en multilingue. & Consommation CPU/GPU supplémentaire. \\
+        \hline
+    \end{tabularx}
+    \caption{Benchmark pour la Recherche Hybride \& Reranking}
+\end{table}
+
+\textbf{Le choix optimal : BM25 couplé au BAAI/bge-reranker}. Cette combinaison locale permet d'interroger à la fois par mots-clés exacts (BM25) et par sens (Embbedings), avant d'être magistralement triée par le \textit{bge-reranker} pour assurer l'extraction parfaite du contexte, tout en conservant les données \textit{On-Premise}.
+
+\subsection{Modèles d'Embedding (Vectorisation)}
+Les modèles d'embedding traduisent un texte en un tableau numérique, crucial pour une recherche sémantique de qualité.
+
+\begin{table}[H]
+    \centering
+    \renewcommand{\arraystretch}{1.5}
+    \begin{tabularx}{\textwidth}{|X|X|X|}
+        \hline
+        \textbf{Modèle} & \textbf{Avantages} & \textbf{Inconvénients} \\
+        \hline
+        \textbf{OpenAI (text-embedding-3)} & Excellente précision, usage via API simple. & Coût récurrent, données envoyées sur le Cloud. \\
+        \hline
+        \textbf{Sentence-Transformers} & Gratuit, léger, exécution 100\% locale. & Précision parfois limitée en français. \\
+        \hline
+        \textbf{BAAI/bge-m3} & Leader actuel, performant en multilingue, exécution locale. & Modèle plus lourd, nécessite davantage de RAM. \\
+        \hline
+    \end{tabularx}
+    \caption{Benchmark des modèles d'Embedding}
+\end{table}
+
+\textbf{Le choix optimal : BAAI/bge-m3 (HuggingFace)}. La confidentialité des données institutionnelles et le coût nul par inférence de ce modèle en font une option supérieure pour un projet sans concessions sur le multilinguisme.
+
+\subsection{Base de Données Vectorielle (Vector Database)}
+La "Vector DB" doit être rapide et capable d'évoluer avec la volumétrie des données extraites. Elle stocke les représentations sémantiques (embeddings) des documents institutionnels et assure la recherche de similarité en temps réel avec des temps de latence minimaux.
+
+\begin{table}[H]
+    \centering
+    \renewcommand{\arraystretch}{1.5}
+    \begin{tabularx}{\textwidth}{|X|X|X|}
+        \hline
+        \textbf{Base de Données} & \textbf{Avantages} & \textbf{Inconvénients} \\
+        \hline
+        \textbf{Pinecone / Weaviate} & Puissant, managé (Cloud), très scalable. & Payant, dépendance cloud externe. \\
+        \hline
+        \textbf{ChromaDB} & Ultra-léger, idéal pour le prototypage rapide en Python. & Limité pour la très haute volumétrie en production. \\
+        \hline
+        \textbf{Qdrant / Milvus} & Open source, très performant pour un portage en production locale. & Configuration de l'infrastructure plus complexe. \\
+        \hline
+    \end{tabularx}
+    \caption{Benchmark des Bases de Données Vectorielles}
+\end{table}
+
+\textbf{Le choix optimal : ChromaDB} pour amorcer la première version et le pipeline RAG de prototypage, suivi d'une migration probable sur \textbf{Qdrant} au moment du déploiement en production entreprise.
+
+\subsection{Outils pour le Pipeline RAG (Framework d'Orchestration)}
+L'orchestrateur cimente l'application, reliant le prompt de l'utilisateur, l'indexation, la base vectorielle et le modèle de génération.
+
+\begin{table}[H]
+    \centering
+    \renewcommand{\arraystretch}{1.5}
+    \begin{tabularx}{\textwidth}{|X|X|X|}
+        \hline
+        \textbf{Framework} & \textbf{Avantages} & \textbf{Inconvénients} \\
+        \hline
+        \textbf{LangChain} & Standard, riche en composants, conçu pour les chaînes et agents complexes. & Courbe d'apprentissage forte, format opaque. \\
+        \hline
+        \textbf{LlamaIndex} & Ultra-optimisé pour l'ingestion de données (PDFs complexes) et la recherche. & Moins généraliste pour des agents autonomes distants. \\
+        \hline
+    \end{tabularx}
+    \caption{Benchmark des Frameworks RAG}
+\end{table}
+
+\textbf{Le choix optimal : LangChain} combiné avec \textbf{LlamaIndex}. LlamaIndex gérera l'ingestion avancée des données web, tandis que LangChain s'impose pour introduire des logiques de routage et préparer l'intégration d'agents spécialisés (aspect Agentique) capables d’interagir avec des services externes.
+
+\subsection{Small Language Models (SLM) / Modèles Génératifs}
+Conformément aux exigences d'un déploiement en entreprise sécurisé, nous privilégions les Small Language Models (SLM) pouvant s'exécuter localement aux immenses LLMs commerciaux.
+
+\begin{table}[H]
+    \centering
+    \renewcommand{\arraystretch}{1.5}
+    \begin{tabularx}{\textwidth}{|X|X|X|}
+        \hline
+        \textbf{Modèle} & \textbf{Avantages} & \textbf{Inconvénients} \\
+        \hline
+        \textbf{GPT-4 / Claude (API)} & Raisonnement exceptionnel, pas besoin de GPU puissant en local. & Problème de confidentialité, coûts récurrents (API). \\
+        \hline
+        \textbf{Mistral 7B} & Poids plume, très doué en français (natif), hébergeable localement. & Raisonnement inférieur face aux modèles 70B+. \\
+        \hline
+        \textbf{Llama-3 (8B)} & Génération véloce (via Ollama), très doué pour les instructions strictes. & Support du français perfectible selon la version. \\
+        \hline
+    \end{tabularx}
+    \caption{Benchmark des Small Language Models (SLM)}
+\end{table}
+
+\textbf{Le choix optimal : Mistral 7B ou Llama-3 8B (Hébergés localement via Ollama)}. Ces SLMs garantissent la totale confidentialité des données exigée en entreprise. Leurs performances sont très satisfaisantes pour la restitution d'informations orientées RAG, avec des besoins matériels (VRAM) maîtrisés.
+
+\subsection{Interface Conversationnelle (Chatbot UI)}
+Conformément au cahier de charge, une interface conversationnelle doit permettre l'interaction en temps réel avec le pipeline RAG. Deux approches sont pertinentes : un front rapide avec Streamlit, ou une interface web complète avec React.js.
+
+\begin{table}[H]
+    \centering
+    \renewcommand{\arraystretch}{1.5}
+    \begin{tabularx}{\textwidth}{|X|X|X|}
+        \hline
+        \textbf{Solution} & \textbf{Avantages} & \textbf{Inconvénients} \\
+        \hline
+        \textbf{Streamlit} & Développement très rapide, intégration native Python, idéal pour démonstration/MVP. & Personnalisation UI limitée, moins adapté aux usages front enterprise avancés. \\
+        \hline
+        \textbf{React.js (Frontend) + API Python} & UI moderne et totalement personnalisable, meilleure séparation Front/Back, plus robuste en production. & Implémentation plus longue, nécessite gestion complète API, auth et déploiement web. \\
+        \hline
+    \end{tabularx}
+    \caption{Benchmark des solutions d'interface conversationnelle}
+\end{table}
+
+\textbf{Le choix optimal :} Usage de \textbf{Streamlit} pour livrer rapidement une première version fonctionnelle du chatbot, puis migrer vers une interface \textbf{React.js} pour une industrialisation (UX avancée, authentification, monitoring front, intégration SI).
+
+\clearpage
+\section{Comparaison Synthétique de l'Architecture}
+
+Le tableau synthétique ci-dessous résume de façon abrégée les solutions explorées et encadre le choix définitif de la première architecture technique recommandée pour le projet.
+
+\begin{table}[H]
+    \centering
+    \renewcommand{\arraystretch}{1.5}
+    \begin{tabularx}{\textwidth}{|p{4.5cm}|X|p{6cm}|}
+        \hline
+        \textbf{Composant du Pipeline} & \textbf{Options (Shortlist)} & \textbf{Choix d'Implémentation (Best Fit)} \\
+        \hline
+        \textbf{Web Crawling} & Scrapy, BeautifulSoup, Crawlee & \textbf{Crawlee} : Extrait un format Markdown propre adapté aux LLMs. \\
+        \hline
+        \textbf{Modèles d'Embeddings} & OpenAI SDK, S-Transformers, BAAI & \textbf{BAAI/bge-m3} : Local, précis en français, aucun coût d'API. \\
+        \hline
+        \textbf{Base de Données Vectorielle} & ChromaDB, Qdrant, Pinecone & \textbf{ChromaDB} pour prototypage, \textbf{Qdrant} pour la production. \\
+        \hline
+        \textbf{Recherche Hybride} & Cohere, Elastisearch, BAAI & \textbf{BM25 + BAAI/bge-reranker} : Allie mots-clés exacts et sémantique. \\
+        \hline
+        \textbf{Orchestration} & LangChain, LlamaIndex, Haystack & \textbf{LangChain + LlamaIndex} : Ingestion de données puis agents. \\
+        \hline
+        \textbf{Générateur (SLM)} & GPT-4 API, Mistral 7B, Llama-3 8B & \textbf{Mistral 7B ou Llama 3 8B (Ollama)} : Assure la confidentialité. \\
+        \hline
+    \end{tabularx}
+    \caption{Synthèse et Recommandation de l'architecture technologique RAG}
+    \label{tab:comparaison_rag_synthese}
+\end{table}
+
+\vspace{0.5cm}
+\section{Conclusion}
+Considérant les impératifs de souveraineté des données, de fiabilité et d'évolutivité d'un déploiement en entreprise au service public (RCAR/CNRA), il en résulte que la pile \textbf{100\% Open Source Locale (BAAI + ChromaDB + LangChain + Mistral/Llama-3)} assure la totalité de la chaîne fonctionnelle demandée. Elle répond efficacement au besoin de recherche sémantique via le pipeline RAG et pave la voie, grâce à LangChain, au développement futur d'agents spécialisés connectés aux services externes.
+
+\end{document}
