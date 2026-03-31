@@ -1,5 +1,6 @@
+.venv/
+env/
 data/
-
-img/
-
-*.pdf
+logs/
+storage/
+__pycache__/
