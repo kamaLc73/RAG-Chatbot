@@ -75,7 +75,7 @@ CRAWLER_CONFIG = {
     "max_concurrency": 3,
 
     # User-Agent présenté aux serveurs
-    "user_agent": "ENSAM-RAG-Bot/1.0 (Projet PFE; contact: kamal.dehbi@ensam.ma)",
+    "user_agent": "ENSAM-RAG-Bot/1.0 (Projet PFE; contact: kamal_dehbi@um5.ac.ma)",
 
     # Respecter robots.txt
     "respect_robots_txt": True,
@@ -101,13 +101,10 @@ PDF_CONFIG = {
     # Taille max d'un PDF accepté (bytes) — 50 MB
     "max_pdf_size_bytes": 50 * 1024 * 1024,
 
-    # Nombre minimum de caractères extraits pour considérer un PDF comme "non scanné"
-    "min_text_chars_threshold": 100,
-
     # Nombre de workers parallèles pour le téléchargement
     "download_concurrency": 3,
 
-    # Timeout max pour le pipeline complet d'un PDF (download + extraction)
+    # Timeout max pour le pipeline de téléchargement d'un PDF
     "per_pdf_task_timeout_seconds": 240,
 
     # Retries automatiques pour le téléchargement des PDFs

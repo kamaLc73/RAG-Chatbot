@@ -1,13 +1,12 @@
 """
-src/crawler/run_crawl.py
-=============================
-Point d'entrée principal pour lancer le crawl.
+src/crawler/main.py
+===================
+Main entry point to run the crawler.
 
-Utilisation :
-    python src/crawler/run_crawl.py --source cnra
-    python src/crawler/run_crawl.py --source rcar
-    python src/crawler/run_crawl.py --source all
-    python src/crawler/run_crawl.py --source all --max-pages 50   # pour tester rapidement
+Usage:
+    python src/crawler/main.py --source cnra
+    python src/crawler/main.py --source rcar
+    python src/crawler/main.py --source all
 """
 
 import argparse
@@ -22,20 +21,10 @@ from typing import Any
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from config.logger import setup_logger
-from config.settings import (
-    CRAWLER_CONFIG,
-    LOGS_DIR,
-    PDF_CONFIG,
-    RAW_DIR,
-    SOURCES,
-)
+from config.settings import CRAWLER_CONFIG, LOGS_DIR, PDF_CONFIG, RAW_DIR, SOURCES
+from crawler.crawler import Crawler
 from loguru import logger
-from crawler.crawler import crawler
 
-
-# ─────────────────────────────────────────────
-# ARGUMENTS CLI
-# ─────────────────────────────────────────────
 
 def parse_args() -> argparse.Namespace:
     source_choices = [*SOURCES.keys(), "all", "both"]
@@ -45,40 +34,40 @@ def parse_args() -> argparse.Namespace:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Exemples :
-  python run_crawl.py --source cnra
-  python run_crawl.py --source all
-  python run_crawl.py --source all --max-pages 20   # mode test rapide
-  python run_crawl.py --source rcar --no-pdfs        # pages seulement
+  python main.py --source cnra
+  python main.py --source all
+  python main.py --source all --max-pages 20
+  python main.py --source rcar --no-pdfs
         """,
     )
     parser.add_argument(
         "--source",
         choices=source_choices,
         default="all",
-        help="Source à crawler (nom de SOURCES) ou all/both pour toutes",
+        help="Source a crawler (nom de SOURCES) ou all/both pour toutes",
     )
     parser.add_argument(
         "--max-pages",
         type=int,
         default=0,
-        help="Nombre max de pages par source (0 = illimité)",
+        help="Nombre max de pages par source (0 = illimite)",
     )
     parser.add_argument(
         "--max-depth",
         type=int,
         default=0,
-        help="Profondeur max de crawl (0 = illimité)",
+        help="Profondeur max de crawl (0 = illimite)",
     )
     parser.add_argument(
         "--max-pdfs",
         type=int,
         default=0,
-        help="Nombre max de PDFs à traiter par source (0 = illimité)",
+        help="Nombre max de PDFs a traiter par source (0 = illimite)",
     )
     parser.add_argument(
         "--no-pdfs",
         action="store_true",
-        help="Désactiver le téléchargement des PDFs",
+        help="Desactiver le telechargement des PDFs",
     )
     parser.add_argument(
         "--production-mode",
@@ -90,38 +79,33 @@ Exemples :
         dest="parallel_sources",
         action="store_true",
         default=True,
-        help="Crawler plusieurs sources en parallèle (activé par défaut)",
+        help="Crawler plusieurs sources en parallele (active par defaut)",
     )
     parser.add_argument(
         "--sequential-sources",
         dest="parallel_sources",
         action="store_false",
-        help="Désactiver le parallélisme des sources et exécuter en séquentiel",
+        help="Desactiver le parallelisme des sources et executer en sequentiel",
     )
     parser.add_argument(
         "--source-parallelism",
         type=int,
         default=0,
-        help="Nombre max de sources crawlées en parallèle (0 = valeur config)",
+        help="Nombre max de sources crawlees en parallele (0 = valeur config)",
     )
     return parser.parse_args()
 
 
-# ─────────────────────────────────────────────
-# RAPPORT FINAL EN JSON
-# ─────────────────────────────────────────────
-
 def save_report(all_stats: dict, output_dir: Path) -> None:
-    """Sauvegarde un rapport JSON de synthèse du crawl complet."""
     report = {
         "crawl_date": datetime.now(timezone.utc).isoformat(),
         "sources": all_stats,
         "totals": {
-            "pages_crawled":    sum(s["pages_crawled"]    for s in all_stats.values()),
-            "pages_failed":     sum(s["pages_failed"]     for s in all_stats.values()),
-            "pdfs_found":       sum(s["pdfs_found"]       for s in all_stats.values()),
-            "pdfs_downloaded":  sum(s["pdfs_downloaded"]  for s in all_stats.values()),
-            "pdfs_failed":      sum(s["pdfs_failed"]      for s in all_stats.values()),
+            "pages_crawled": sum(s["pages_crawled"] for s in all_stats.values()),
+            "pages_failed": sum(s["pages_failed"] for s in all_stats.values()),
+            "pdfs_found": sum(s["pdfs_found"] for s in all_stats.values()),
+            "pdfs_downloaded": sum(s["pdfs_downloaded"] for s in all_stats.values()),
+            "pdfs_failed": sum(s["pdfs_failed"] for s in all_stats.values()),
         },
     }
 
@@ -129,9 +113,9 @@ def save_report(all_stats: dict, output_dir: Path) -> None:
     with open(report_path, "w", encoding="utf-8") as f:
         json.dump(report, f, ensure_ascii=False, indent=2)
 
-    logger.info(f"📊 Rapport sauvegardé : {report_path}")
-    logger.info(f"   Total pages  : {report['totals']['pages_crawled']}")
-    logger.info(f"   Total PDFs   : {report['totals']['pdfs_downloaded']}")
+    logger.info(f"Rapport sauvegarde : {report_path}")
+    logger.info(f"Total pages  : {report['totals']['pages_crawled']}")
+    logger.info(f"Total PDFs   : {report['totals']['pdfs_downloaded']}")
 
 
 async def crawl_one_source(
@@ -143,9 +127,9 @@ async def crawl_one_source(
     semaphore: asyncio.Semaphore | None = None,
 ) -> tuple[str, dict[str, Any]]:
     async def _run() -> tuple[str, dict[str, Any]]:
-        logger.info(f"\n🌐 Source : {source_name.upper()} → {base_url}")
+        logger.info(f"Source : {source_name.upper()} -> {base_url}")
 
-        crawl_runner = crawler(
+        crawl_runner = Crawler(
             source=source_name,
             base_url=base_url,
             raw_dir=RAW_DIR,
@@ -164,27 +148,19 @@ async def crawl_one_source(
         return await _run()
 
 
-# ─────────────────────────────────────────────
-# MAIN
-# ─────────────────────────────────────────────
-
-async def main() -> None:
+async def run_crawler() -> None:
     args = parse_args()
 
-    # Initialiser le logger
     setup_logger(log_dir=LOGS_DIR, source="crawl")
 
-    # Déterminer les sources à crawler
     if args.source in {"all", "both"}:
         sources_to_crawl = list(SOURCES.items())
     else:
         sources_to_crawl = [(args.source, SOURCES[args.source])]
 
-    # Surcharger les configs si des arguments CLI sont passés
     config = CRAWLER_CONFIG.copy()
     if args.max_pages:
         config["max_pages_per_source"] = args.max_pages
-        # En mode test borné, limiter la concurrence évite de dépasser fortement la cible.
         config["max_concurrency"] = 1
     if args.max_depth:
         config["max_depth"] = args.max_depth
@@ -192,20 +168,18 @@ async def main() -> None:
         config["max_pdfs_per_source"] = args.max_pdfs
     if args.production_mode:
         config["production_mode"] = True
-        logger.info("Mode production activé: exclusion login/inscription/compte")
+        logger.info("Mode production active")
 
     pdf_cfg = PDF_CONFIG.copy()
     if args.no_pdfs:
-        # Désactiver les PDFs en mettant une taille max de 0
-        logger.info("Mode --no-pdfs activé : les PDFs ne seront pas téléchargés")
+        logger.info("Mode --no-pdfs active")
 
-    # Lancer chaque source séquentiellement (pour ne pas surcharger les serveurs)
-    all_stats: dict = {}
+    all_stats: dict[str, dict[str, Any]] = {}
 
     if args.parallel_sources and len(sources_to_crawl) > 1:
         parallelism = args.source_parallelism or int(config.get("source_parallelism", 2))
         parallelism = max(1, parallelism)
-        logger.info(f"Mode parallèle sources activé (max {parallelism} source(s) simultanée(s))")
+        logger.info(f"Mode parallele sources active (max {parallelism})")
         semaphore = asyncio.Semaphore(parallelism)
         tasks = [
             crawl_one_source(
@@ -232,13 +206,15 @@ async def main() -> None:
             )
             all_stats[source_name_result] = stats
 
-            # Petite pause entre les sources en mode séquentiel
             if len(sources_to_crawl) > 1:
                 await asyncio.sleep(3)
 
-    # Sauvegarder le rapport global
     save_report(all_stats, RAW_DIR)
 
 
+def main() -> None:
+    asyncio.run(run_crawler())
+
+
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
