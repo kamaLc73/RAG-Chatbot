@@ -1,13 +1,3 @@
-"""
-config/logger.py
-================
-Configuration centralisee du logging pour la phase 1.
-
-Ce module fournit :
-  - setup_logger() : configuration Loguru (console + fichier)
-  - log_failed_url() : ecriture robuste des URLs en echec dans failed_urls.json
-"""
-
 from __future__ import annotations
 
 import json
@@ -21,6 +11,18 @@ from loguru import logger
 # Chemin partage du fichier des URLs en echec
 _FAILED_URLS_PATH: Path | None = None
 _FAILED_URLS_LOCK = threading.Lock()
+
+def _resolve_log_filename(source: str) -> str:
+    """Map source aliases to stable log filenames."""
+    key = (source or "").strip().lower()
+    aliases = {
+        "rag_chatbot": "chatbot",
+        "chatbot": "chatbot",
+        "rag_pipeline": "pipeline",
+        "pipeline": "pipeline",
+    }
+    normalized = aliases.get(key, key or "crawl")
+    return f"{normalized}.log"
 
 
 def setup_logger(log_dir: Path, source: str = "crawl") -> None:
@@ -42,7 +44,7 @@ def setup_logger(log_dir: Path, source: str = "crawl") -> None:
     # Sortie console lisible pendant l'execution du crawl.
     logger.add(
         sink=lambda msg: print(msg, end=""),
-        level="INFO",
+        level="DEBUG",
         colorize=True,
         format="<green>{time:YYYY-MM-DD HH:mm:ss}</green> | "
         "<level>{level: <8}</level> | "
@@ -51,12 +53,12 @@ def setup_logger(log_dir: Path, source: str = "crawl") -> None:
     )
 
     # Fichier detaille pour audit/debug (rotation + retention).
+    log_file_path = log_dir / _resolve_log_filename(source)
+
     logger.add(
-        sink=log_dir / f"{source}.log",
+        sink=log_file_path,
         level="DEBUG",
         encoding="utf-8",
-        rotation="10 MB",
-        retention="30 days",
         enqueue=True,
         backtrace=False,
         diagnose=False,
@@ -65,7 +67,7 @@ def setup_logger(log_dir: Path, source: str = "crawl") -> None:
     )
 
     logger.info(f"Logger initialise. Dossier logs: {log_dir}")
-    logger.info(f"Fichier des URLs echouees: {_FAILED_URLS_PATH}")
+    logger.info(f"Fichier log principal: {log_file_path}")
 
 
 def log_failed_url(

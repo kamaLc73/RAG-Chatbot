@@ -5,3 +5,5 @@ logs/
 storage/
 __pycache__/
 Tesseract-OCR/
+.env
+docs/

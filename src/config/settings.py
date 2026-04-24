@@ -1,10 +1,3 @@
-"""
-src/config/settings.py
-==================
-Configuration centralisée du projet RAG RCAR/CNRA.
-Modifier ce fichier pour ajuster les paramètres sans toucher au code métier.
-"""
-
 from pathlib import Path
 
 # ─────────────────────────────────────────────
