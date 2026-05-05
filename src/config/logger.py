@@ -11,6 +11,7 @@ from loguru import logger
 # Chemin partage du fichier des URLs en echec
 _FAILED_URLS_PATH: Path | None = None
 _FAILED_URLS_LOCK = threading.Lock()
+_LOGGER_INITIALIZED = False
 
 def _resolve_log_filename(source: str) -> str:
     """Map source aliases to stable log filenames."""
@@ -33,7 +34,7 @@ def setup_logger(log_dir: Path, source: str = "crawl") -> None:
         log_dir: Dossier des logs.
         source: Prefixe du fichier principal de log.
     """
-    global _FAILED_URLS_PATH
+    global _FAILED_URLS_PATH, _LOGGER_INITIALIZED
 
     log_dir.mkdir(parents=True, exist_ok=True)
     _FAILED_URLS_PATH = log_dir / "failed_urls.json"
@@ -68,6 +69,12 @@ def setup_logger(log_dir: Path, source: str = "crawl") -> None:
 
     logger.info(f"Logger initialise. Dossier logs: {log_dir}")
     logger.info(f"Fichier log principal: {log_file_path}")
+    _LOGGER_INITIALIZED = True
+
+
+def is_logger_initialized() -> bool:
+    """Indique si le logger projet a déjà été configuré dans ce process."""
+    return _LOGGER_INITIALIZED
 
 
 def log_failed_url(

@@ -1,13 +1,17 @@
 """
 src/chatbot/rag_pipeline.py
 ============================
-Pipeline RAG principal + suggestions vidéos YouTube CNRA-RCAR.
+Pipeline RAG principal + suggestions vidéos YouTube + suggestions formulaires.
 
-Changements vs version originale:
-    - VideoRetriever chargé au démarrage (optionnel, silencieux si absent)
-    - rag.query() retourne un champ "videos" supplémentaire
-    - La recherche vidéo tourne en parallèle avec la retrieval documentaire
-    - Le cache inclut les suggestions vidéo
+Champs retournés par query() :
+    {
+        "response":      str,        # Réponse textuelle
+        "context_docs":  int,        # Chunks documentaires utilisés
+        "videos":        list[dict], # Vidéos YouTube pertinentes
+        "forms":         list[dict], # Formulaires CNRA/RCAR pertinents
+        "original_query": str,
+        "cached":        bool,
+    }
 """
 
 import os
@@ -39,7 +43,6 @@ try:
 except Exception:
     pass
 
-
 src_root = Path(__file__).resolve().parents[1]
 if str(src_root) not in sys.path:
     sys.path.insert(0, str(src_root))
@@ -47,19 +50,25 @@ if str(src_root) not in sys.path:
 from config.logger import setup_logger
 from config.settings import BASE_DIR, LOGS_DIR
 
-# Import VideoRetriever (optionnel — silencieux si non disponible)
+# ── Retrievers optionnels ─────────────────────────────────────────────────────
 try:
     from chatbot.video_retriever import VideoRetriever
     _VIDEO_RETRIEVER_AVAILABLE = True
 except ImportError:
     _VIDEO_RETRIEVER_AVAILABLE = False
-    logger.warning("VideoRetriever non disponible (import échoué).")
+    logger.warning("VideoRetriever non disponible.")
 
+try:
+    from chatbot.form_retriever import FormRetriever
+    _FORM_RETRIEVER_AVAILABLE = True
+except ImportError:
+    _FORM_RETRIEVER_AVAILABLE = False
+    logger.warning("FormRetriever non disponible.")
 
 load_dotenv(BASE_DIR / ".env")
 
 VECTORSTORE_RELATIVE_PATH = Path("data") / "vectorstore" / "chroma_db"
-DEFAULT_EMBEDDING_MODEL = "BAAI/bge-m3"
+DEFAULT_EMBEDDING_MODEL   = "BAAI/bge-m3"
 HF_TOKEN = getenv("HF_TOKEN", "").strip().strip('"\'')
 
 OLLAMA_MODEL       = getenv("OLLAMA_MODEL", "mistral:latest").strip().strip('"\'')
@@ -84,6 +93,7 @@ class RAGPipeline:
         collection_name: str = "rcar_cnra_fr",
         embedding_model: str = DEFAULT_EMBEDDING_MODEL,
         enable_video_suggestions: bool = True,
+        enable_form_suggestions:  bool = True,
     ):
         resolved_path = Path(vectorstore_path)
         if not resolved_path.is_absolute():
@@ -116,7 +126,7 @@ class RAGPipeline:
         )
         self._warm_up_embeddings()
 
-        # ── VectorStore ───────────────────────────────────────────────────────
+        # ── VectorStore principal ─────────────────────────────────────────────
         self.vectorstore = Chroma(
             persist_directory=str(resolved_path),
             embedding_function=self.embeddings,
@@ -135,20 +145,27 @@ class RAGPipeline:
                 if self.video_retriever.available:
                     logger.info("Suggestions vidéo YouTube : activées")
                 else:
-                    logger.info(
-                        "Suggestions vidéo YouTube : désactivées "
-                        "(lance index_videos.py pour les activer)"
-                    )
+                    logger.info("Suggestions vidéo YouTube : désactivées (lance index_videos.py)")
             except Exception as exc:
                 logger.warning("VideoRetriever init échoué: {}", exc)
 
+        # ── FormRetriever (optionnel) ─────────────────────────────────────────
+        self.form_retriever = None
+        if enable_form_suggestions and _FORM_RETRIEVER_AVAILABLE:
+            try:
+                self.form_retriever = FormRetriever()
+                if self.form_retriever.available:
+                    logger.info("Suggestions formulaires : activées")
+                else:
+                    logger.info("Suggestions formulaires : désactivées (lance index_forms.py)")
+            except Exception as exc:
+                logger.warning("FormRetriever init échoué: {}", exc)
+
         # ── LLM ───────────────────────────────────────────────────────────────
-        is_cloud = "ollama.com" in OLLAMA_BASE_URL
+        is_cloud    = "ollama.com" in OLLAMA_BASE_URL
         client_kwargs = (
             {"headers": {"Authorization": f"Bearer {OLLAMA_API_KEY}"}} if OLLAMA_API_KEY else None
         )
-        if is_cloud and not OLLAMA_API_KEY:
-            logger.warning("ollama.com détecté sans OLLAMA_API_KEY — authentification requise.")
 
         llm_kwargs = dict(
             model=local_model,
@@ -175,8 +192,7 @@ class RAGPipeline:
     def _get_collection_count(self, path: Path, collection_name: str) -> int:
         try:
             return PersistentClient(path=str(path)).get_collection(collection_name).count()
-        except Exception as exc:
-            logger.warning("Compteur collection indisponible: {}", exc)
+        except Exception:
             return 0
 
     def _system_prompt(self) -> str:
@@ -197,23 +213,11 @@ class RAGPipeline:
     - Soyez precis sur les organismes : distinguez toujours ce qui concerne le RCAR de ce qui concerne la CNRA.
 
     FORMAT DE REPONSE:
-    - Texte brut uniquement, sans aucune syntaxe Markdown (pas de **, ##, __, backticks, ni tirets triples).
-    - Respectez les regles normales de capitalisation du francais :
-        * Chaque phrase commence par une majuscule.
-        * Les noms propres et sigles (CNRA, RCAR, CDG, Maroc) gardent leurs majuscules.
-        * Le reste du texte est en minuscules normales.
+    - Texte brut uniquement, sans aucune syntaxe Markdown.
     - Reponses structurees en phrases courtes et claires.
     - Pour les listes, commencez chaque element par "- " sur une nouvelle ligne.
-    - Pour les titres de section, ecrivez la premiere lettre en majuscule, suivie de deux-points. Exemple : "Missions principales :"
-    - Longueur adaptee a la question : courte si la question est simple, detaillee si elle est complexe.
+    - Longueur adaptee a la question.
 
-    EXEMPLE DE BONNE REPONSE:
-    La CNRA est un etablissement public marocain.
-
-    Missions principales :
-    - Gestion des rentes d accidents du travail.
-    - Emission de produits d assurance-vie.
-    FIN DE L EXEMPLE.
     CONTEXTE DOCUMENTAIRE:
     {context}"""
 
@@ -248,8 +252,7 @@ class RAGPipeline:
             self.response_cache.popitem(last=False)
 
     def _retrieve_videos(self, query: str) -> list[dict]:
-        """Lance la recherche vidéo. Retourne [] si non disponible."""
-        if self.video_retriever is None or not self.video_retriever.available:
+        if not self.video_retriever or not self.video_retriever.available:
             return []
         try:
             return self.video_retriever.retrieve(query)
@@ -257,28 +260,26 @@ class RAGPipeline:
             logger.warning("Erreur recherche vidéo: {}", exc)
             return []
 
+    def _retrieve_forms(self, query: str) -> list[dict]:
+        if not self.form_retriever or not self.form_retriever.available:
+            return []
+        try:
+            return self.form_retriever.retrieve(query)
+        except Exception as exc:
+            logger.warning("Erreur recherche formulaires: {}", exc)
+            return []
+
     # ── API publique ──────────────────────────────────────────────────────────
 
     def query(self, query: str) -> dict:
         """
-        Traite une question et retourne la réponse + métadonnées + suggestions vidéo.
-
-        Retour:
-            {
-                "response": str,          # Réponse textuelle
-                "context_docs": int,      # Nombre de chunks utilisés
-                "videos": list[dict],     # Vidéos YouTube pertinentes (peut être [])
-                "original_query": str,
-                "cached": bool,
-                "error": bool,            # Présent seulement si erreur
-            }
+        Traite une question. Retourne réponse + vidéos + formulaires.
         """
         cleaned = (query or "").strip()
         if not cleaned:
-            return {"response": "Veuillez saisir une question.", "error": True, "videos": []}
+            return {"response": "Veuillez saisir une question.", "error": True, "videos": [], "forms": []}
 
         if cached := self._cache_get(cleaned.lower()):
-            logger.info("Cache hit")
             return {**cached, "original_query": query, "cached": True}
 
         if self.collection_count == 0:
@@ -286,35 +287,31 @@ class RAGPipeline:
                 "response": "Base vectorielle vide — lancez index_data.py puis réessayez.",
                 "error": True,
                 "videos": [],
+                "forms":  [],
             }
 
         # ── Recherche documentaire ────────────────────────────────────────────
         t0 = time.perf_counter()
         try:
-            docs = self.vectorstore.similarity_search(cleaned, k=self.retrieval_k)
+            docs    = self.vectorstore.similarity_search(cleaned, k=self.retrieval_k)
             context = self._build_context(docs)
             logger.info("Retrieval: {} docs en {:.3f}s", len(docs), time.perf_counter() - t0)
-
-            for i, doc in enumerate(docs, 1):
-                source = doc.metadata.get("source", "source inconnue")
-                preview = (doc.page_content or "").replace("\n", " ").strip()[:150]
-                logger.debug("Chunk {}/{} | source={} | apercu: {}...", i, len(docs), source, preview)
-            logger.debug("Contexte total envoye au LLM: {} chars", len(context))
-
         except Exception as exc:
             logger.error("Erreur retrieval: {}", exc)
-            return {"response": "Erreur lors de la recherche vectorielle.", "error": True, "videos": []}
+            return {"response": "Erreur lors de la recherche.", "error": True, "videos": [], "forms": []}
 
         if not docs:
-            return {"response": "Aucun passage pertinent trouvé.", "context_docs": 0, "videos": []}
+            return {"response": "Aucun passage pertinent trouvé.", "context_docs": 0, "videos": [], "forms": []}
 
-        # ── Recherche vidéo (parallèle en logique, séquentielle en pratique) ──
-        t_video = time.perf_counter()
+        # ── Recherche vidéos ──────────────────────────────────────────────────
+        t_v = time.perf_counter()
         videos = self._retrieve_videos(cleaned)
-        logger.info(
-            "Recherche vidéo: {} résultat(s) en {:.3f}s",
-            len(videos), time.perf_counter() - t_video,
-        )
+        logger.info("Vidéos: {} en {:.3f}s", len(videos), time.perf_counter() - t_v)
+
+        # ── Recherche formulaires ─────────────────────────────────────────────
+        t_f = time.perf_counter()
+        forms = self._retrieve_forms(cleaned)
+        logger.info("Formulaires: {} en {:.3f}s", len(forms), time.perf_counter() - t_f)
 
         # ── Génération LLM ────────────────────────────────────────────────────
         t1 = time.perf_counter()
@@ -324,18 +321,17 @@ class RAGPipeline:
         except Exception as exc:
             logger.error("Erreur génération: {}", exc)
             return {
-                "response": (
-                    "Erreur de génération. Vérifiez qu'Ollama est lancé "
-                    f"(ollama pull {OLLAMA_MODEL})."
-                ),
+                "response": f"Erreur de génération. Vérifiez qu'Ollama est lancé (ollama pull {OLLAMA_MODEL}).",
                 "error": True,
-                "videos": videos,  # Retourner les vidéos même si la génération échoue
+                "videos": videos,
+                "forms":  forms,
             }
 
         payload = {
-            "response": response,
+            "response":     response,
             "context_docs": len(docs),
-            "videos": videos,
+            "videos":       videos,
+            "forms":        forms,
         }
         self._cache_set(cleaned.lower(), payload)
         return {**payload, "original_query": query, "cached": False}
@@ -344,4 +340,4 @@ class RAGPipeline:
 if __name__ == "__main__":
     setup_logger(log_dir=LOGS_DIR, source="pipeline")
     rag = RAGPipeline()
-    logger.info(rag.query("c'est quoi CNRA ?"))
+    print(rag.query("comment faire une demande de pension de retraite RCAR ?"))

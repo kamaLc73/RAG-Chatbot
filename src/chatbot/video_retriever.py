@@ -25,11 +25,15 @@ if str(src_root) not in sys.path:
     sys.path.insert(0, str(src_root))
 
 try:
-    from config.settings import BASE_DIR
+    from config.logger import is_logger_initialized, setup_logger
+    from config.settings import BASE_DIR, LOGS_DIR
     from dotenv import load_dotenv
     load_dotenv(BASE_DIR / ".env")
 except ImportError:
     BASE_DIR = Path(__file__).resolve().parents[2]
+    LOGS_DIR = BASE_DIR / "logs"
+    is_logger_initialized = lambda: False
+    setup_logger = None
 
 YOUTUBE_VECTORSTORE_DIR = BASE_DIR / "data" / "vectorstore" / "chroma_db_youtube"
 COLLECTION_NAME = "youtube_videos"
@@ -79,6 +83,9 @@ class VideoRetriever:
         self._available = False
         self.vectorstore = None
         self.reranker = None
+
+        if setup_logger is not None and not is_logger_initialized():
+            setup_logger(log_dir=LOGS_DIR, source="youtube_fetch")
 
         # Vérification silencieuse : pas de crash si pas encore indexé
         if not vectorstore_dir.exists():

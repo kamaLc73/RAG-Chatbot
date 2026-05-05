@@ -44,12 +44,12 @@ if str(src_root) not in sys.path:
 try:
     from config.settings import BASE_DIR, LOGS_DIR
     from config.logger import setup_logger
-    setup_logger(LOGS_DIR, source="youtube_fetch")
+    setup_logger(LOGS_DIR, source="fetch_youtube")
 except Exception:
     BASE_DIR = Path(__file__).resolve().parents[2]
     LOGS_DIR = BASE_DIR / "logs"
     LOGS_DIR.mkdir(parents=True, exist_ok=True)
-    logger.add(LOGS_DIR / "youtube_fetch.log", level="INFO")
+    logger.add(LOGS_DIR / "fetch_youtube.log", level="INFO")
 
 CHANNEL_URL = "https://www.youtube.com/@CNRA_RCAR/videos"
 OUTPUT_DIR = BASE_DIR / "data" / "youtube"
