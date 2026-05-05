@@ -74,6 +74,8 @@ class FormRetriever:
         top_k_retrieve:     int   = TOP_K_RETRIEVE,
         top_k_final:        int   = TOP_K_FINAL,
         relevance_threshold: float = RELEVANCE_THRESHOLD,
+        shared_embeddings=None,
+        shared_reranker=None,
     ):
         self.top_k_retrieve      = top_k_retrieve
         self.top_k_final         = top_k_final
@@ -81,6 +83,7 @@ class FormRetriever:
         self._available          = False
         self.vectorstore         = None
         self.reranker            = None
+        self.embeddings = shared_embeddings  # ✅ Instance partagée
 
         if setup_logger is not None and not is_logger_initialized():
             setup_logger(log_dir=LOGS_DIR, source="forms")
@@ -99,10 +102,14 @@ class FormRetriever:
             logger.warning("FormRetriever: impossible de charger le vectorstore: {}", exc)
             return
 
-        try:
-            self._load_reranker(reranker_model)
-        except Exception as exc:
-            logger.warning("FormRetriever: reranker indisponible ({}). Scores vectoriels uniquement.", exc)
+        # ✅ Accepte le reranker partagé, ou le charge seul si absent
+        if shared_reranker is not None:
+            self.reranker = shared_reranker
+        else:
+            try:
+                self._load_reranker(reranker_model)
+            except Exception as exc:
+                logger.warning("FormRetriever: reranker indisponible ({}). Scores vectoriels uniquement.", exc)
 
         self._available = True
         logger.info(
@@ -117,6 +124,19 @@ class FormRetriever:
         from langchain_chroma import Chroma
         from langchain_huggingface import HuggingFaceEmbeddings
 
+        # ✅ Utilise les embeddings partagés si disponibles (pas de re-chargement)
+        if self.embeddings is not None:
+            logger.info("FormRetriever: utilise embeddings partagés (optimisation VRAM)")
+            self.vectorstore = Chroma(
+                persist_directory=str(directory),
+                embedding_function=self.embeddings,
+                collection_name=collection_name,
+            )
+            count = self.vectorstore._collection.count()
+            logger.info("Forms vectorstore: {} formulaires indexés", count)
+            return
+
+        # Fallback : charger seul si pas d'instance partagée
         try:
             import torch
             device = "cuda" if torch.cuda.is_available() else "cpu"

@@ -19,6 +19,7 @@ import sys
 import time
 import warnings
 from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from os import getenv
 
@@ -28,6 +29,11 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 warnings.filterwarnings("ignore", message=r"Accessing `__path__` from `\.models\..*",)
 warnings.filterwarnings("ignore", category=FutureWarning)
 
+try:
+    import torch
+except ImportError:
+    torch = None
+
 from chromadb import PersistentClient
 from dotenv import load_dotenv
 from langchain_chroma import Chroma
@@ -36,6 +42,7 @@ from langchain_core.prompts import ChatPromptTemplate
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_ollama import ChatOllama
 from loguru import logger
+from sentence_transformers import CrossEncoder
 
 try:
     from transformers.utils import logging as transformers_logging
@@ -109,22 +116,53 @@ class RAGPipeline:
 
         # ── Embeddings ────────────────────────────────────────────────────────
         try:
-            import torch
-            device = "cuda" if torch.cuda.is_available() else "cpu"
+            device = "cuda" if (torch and torch.cuda.is_available()) else "cpu"
         except Exception:
             device = "cpu"
 
         logger.info("Embedding: {} sur {}", embedding_model, device)
-        model_kwargs = {"device": device}
+        model_kwargs = {
+            "device": device,
+        }
+        
         if HF_TOKEN:
             model_kwargs["token"] = HF_TOKEN
 
+        # ✅ Instance unique partagée : batch_size=32 pour exploiter la GPU
         self.embeddings = HuggingFaceEmbeddings(
             model_name=embedding_model,
             model_kwargs=model_kwargs,
-            encode_kwargs={"normalize_embeddings": True},
+            encode_kwargs={"normalize_embeddings": True, "batch_size": 32},
         )
+        
+        # ✅ FP16 casting après chargement (réduit ~570MB → ~285MB VRAM)
+        try:
+            if device == "cuda" and hasattr(self.embeddings, "client") and self.embeddings.client is not None:
+                if hasattr(self.embeddings.client, "model") and self.embeddings.client.model is not None:
+                    self.embeddings.client.model.half()
+                    logger.info("Embeddings castées en FP16 (GPU) — économie VRAM")
+        except Exception as exc:
+            logger.debug("Embeddings FP16 cast échoué (fallback FP32): {}", exc)
+        
         self._warm_up_embeddings()
+
+        # ✅ Reranker unique partagé avec FP16 sur GPU
+        self.shared_reranker = None
+        try:
+            self.shared_reranker = CrossEncoder(
+                "BAAI/bge-reranker-v2-m3",
+                max_length=512,
+                device=device,
+            )
+            # Cast en FP16 sur GPU pour ×1.5-2 de speedup et −850MB VRAM
+            if device == "cuda" and self.shared_reranker.model is not None:
+                try:
+                    self.shared_reranker.model.half()
+                    logger.info("Reranker castée en FP16 (GPU)")
+                except Exception as exc:
+                    logger.debug("Reranker FP16 cast échoué: {}", exc)
+        except Exception as exc:
+            logger.warning("Reranker non disponible ({}), mode fallback activé", exc)
 
         # ── VectorStore principal ─────────────────────────────────────────────
         self.vectorstore = Chroma(
@@ -141,7 +179,11 @@ class RAGPipeline:
         self.video_retriever = None
         if enable_video_suggestions and _VIDEO_RETRIEVER_AVAILABLE:
             try:
-                self.video_retriever = VideoRetriever()
+                # ✅ Injection des instances partagées (pas de re-chargement)
+                self.video_retriever = VideoRetriever(
+                    shared_embeddings=self.embeddings,
+                    shared_reranker=self.shared_reranker,
+                )
                 if self.video_retriever.available:
                     logger.info("Suggestions vidéo YouTube : activées")
                 else:
@@ -153,7 +195,11 @@ class RAGPipeline:
         self.form_retriever = None
         if enable_form_suggestions and _FORM_RETRIEVER_AVAILABLE:
             try:
-                self.form_retriever = FormRetriever()
+                # ✅ Injection des instances partagées (pas de re-chargement)
+                self.form_retriever = FormRetriever(
+                    shared_embeddings=self.embeddings,
+                    shared_reranker=self.shared_reranker,
+                )
                 if self.form_retriever.available:
                     logger.info("Suggestions formulaires : activées")
                 else:
@@ -303,15 +349,27 @@ class RAGPipeline:
         if not docs:
             return {"response": "Aucun passage pertinent trouvé.", "context_docs": 0, "videos": [], "forms": []}
 
-        # ── Recherche vidéos ──────────────────────────────────────────────────
-        t_v = time.perf_counter()
-        videos = self._retrieve_videos(cleaned)
-        logger.info("Vidéos: {} en {:.3f}s", len(videos), time.perf_counter() - t_v)
-
-        # ── Recherche formulaires ─────────────────────────────────────────────
-        t_f = time.perf_counter()
-        forms = self._retrieve_forms(cleaned)
-        logger.info("Formulaires: {} en {:.3f}s", len(forms), time.perf_counter() - t_f)
+        # ── Recherche vidéos + formulaires en parallèle ────────────────────────
+        # ✅ Optimisation : exécution parallèle au lieu de séquentielle
+        # Les deux retrievals font de l'I/O + inférence indépendants
+        videos, forms = [], []
+        t_parallel_start = time.perf_counter()
+        
+        try:
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                fut_videos = pool.submit(self._retrieve_videos, cleaned)
+                fut_forms = pool.submit(self._retrieve_forms, cleaned)
+                videos = fut_videos.result(timeout=30)
+                forms = fut_forms.result(timeout=30)
+            t_parallel_elapsed = time.perf_counter() - t_parallel_start
+            logger.info(
+                "Parallel retrieval: vidéos={} formulaires={} en {:.3f}s",
+                len(videos), len(forms), t_parallel_elapsed
+            )
+        except Exception as exc:
+            logger.warning("Parallel retrieval échoué (fallback séquentiel): {}", exc)
+            videos = self._retrieve_videos(cleaned)
+            forms = self._retrieve_forms(cleaned)
 
         # ── Génération LLM ────────────────────────────────────────────────────
         t1 = time.perf_counter()

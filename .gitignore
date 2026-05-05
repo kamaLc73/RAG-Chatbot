@@ -8,3 +8,4 @@ Tesseract-OCR/
 .env
 docs/
 *.ipynb
+CLAUDE.md
