@@ -1,3 +1,15 @@
+"""
+src/chatbot/rag_pipeline.py
+============================
+Pipeline RAG principal + suggestions vidéos YouTube CNRA-RCAR.
+
+Changements vs version originale:
+    - VideoRetriever chargé au démarrage (optionnel, silencieux si absent)
+    - rag.query() retourne un champ "videos" supplémentaire
+    - La recherche vidéo tourne en parallèle avec la retrieval documentaire
+    - Le cache inclut les suggestions vidéo
+"""
+
 import os
 import sys
 import time
@@ -23,7 +35,6 @@ from loguru import logger
 
 try:
     from transformers.utils import logging as transformers_logging
-
     transformers_logging.set_verbosity_error()
 except Exception:
     pass
@@ -36,6 +47,14 @@ if str(src_root) not in sys.path:
 from config.logger import setup_logger
 from config.settings import BASE_DIR, LOGS_DIR
 
+# Import VideoRetriever (optionnel — silencieux si non disponible)
+try:
+    from chatbot.video_retriever import VideoRetriever
+    _VIDEO_RETRIEVER_AVAILABLE = True
+except ImportError:
+    _VIDEO_RETRIEVER_AVAILABLE = False
+    logger.warning("VideoRetriever non disponible (import échoué).")
+
 
 load_dotenv(BASE_DIR / ".env")
 
@@ -46,16 +65,15 @@ HF_TOKEN = getenv("HF_TOKEN", "").strip().strip('"\'')
 OLLAMA_MODEL       = getenv("OLLAMA_MODEL", "mistral:latest").strip().strip('"\'')
 OLLAMA_BASE_URL    = getenv("OLLAMA_BASE_URL", "http://localhost:11434")
 OLLAMA_API_KEY     = getenv("OLLAMA_API_KEY", "").strip().strip('"\'')
-OLLAMA_TEMPERATURE = 0.1       # Moins de créativité = moins de "remplissage" inventé
-OLLAMA_NUM_PREDICT = 600       # Suffisant pour une réponse structurée et précise
-OLLAMA_NUM_CTX     = 4096      # Confortable : prompt + contexte + réponse sans coupure
+OLLAMA_TEMPERATURE = 0.1
+OLLAMA_NUM_PREDICT = 600
+OLLAMA_NUM_CTX     = 4096
 OLLAMA_KEEP_ALIVE  = "30m"
 
-RAG_TOP_K             = 4      # 4 chunks bien choisis > 5 chunks dont un hors sujet
-RAG_MAX_CONTEXT_CHARS = 2800   # Cohérent avec NUM_CTX : laisse ~270 tokens pour la réponse
-RAG_MAX_DOC_CHARS     = 700    # Chunks plus courts = plus de diversité dans le contexte
-RAG_CACHE_SIZE        = 100    # OK, à garder
-
+RAG_TOP_K             = 4
+RAG_MAX_CONTEXT_CHARS = 2800
+RAG_MAX_DOC_CHARS     = 700
+RAG_CACHE_SIZE        = 100
 
 
 class RAGPipeline:
@@ -65,15 +83,16 @@ class RAGPipeline:
         vectorstore_path: Path | str = VECTORSTORE_RELATIVE_PATH,
         collection_name: str = "rcar_cnra_fr",
         embedding_model: str = DEFAULT_EMBEDDING_MODEL,
+        enable_video_suggestions: bool = True,
     ):
         resolved_path = Path(vectorstore_path)
         if not resolved_path.is_absolute():
             resolved_path = (BASE_DIR / resolved_path).resolve()
 
-        self.collection_name  = collection_name
-        self.retrieval_k      = RAG_TOP_K
+        self.collection_name   = collection_name
+        self.retrieval_k       = RAG_TOP_K
         self.max_context_chars = RAG_MAX_CONTEXT_CHARS
-        self.max_doc_chars    = RAG_MAX_DOC_CHARS
+        self.max_doc_chars     = RAG_MAX_DOC_CHARS
         self.response_cache: OrderedDict = OrderedDict()
 
         logger.info("VectorStore: {} (collection={})", resolved_path, collection_name)
@@ -107,6 +126,21 @@ class RAGPipeline:
         logger.info("Collection '{}': {} chunks", collection_name, self.collection_count)
         if self.collection_count == 0:
             logger.warning("Collection vide — lancez index_data.py pour l'indexation.")
+
+        # ── VideoRetriever (optionnel) ────────────────────────────────────────
+        self.video_retriever = None
+        if enable_video_suggestions and _VIDEO_RETRIEVER_AVAILABLE:
+            try:
+                self.video_retriever = VideoRetriever()
+                if self.video_retriever.available:
+                    logger.info("Suggestions vidéo YouTube : activées")
+                else:
+                    logger.info(
+                        "Suggestions vidéo YouTube : désactivées "
+                        "(lance index_videos.py pour les activer)"
+                    )
+            except Exception as exc:
+                logger.warning("VideoRetriever init échoué: {}", exc)
 
         # ── LLM ───────────────────────────────────────────────────────────────
         is_cloud = "ollama.com" in OLLAMA_BASE_URL
@@ -213,13 +247,35 @@ class RAGPipeline:
         while len(self.response_cache) > RAG_CACHE_SIZE:
             self.response_cache.popitem(last=False)
 
+    def _retrieve_videos(self, query: str) -> list[dict]:
+        """Lance la recherche vidéo. Retourne [] si non disponible."""
+        if self.video_retriever is None or not self.video_retriever.available:
+            return []
+        try:
+            return self.video_retriever.retrieve(query)
+        except Exception as exc:
+            logger.warning("Erreur recherche vidéo: {}", exc)
+            return []
+
     # ── API publique ──────────────────────────────────────────────────────────
 
     def query(self, query: str) -> dict:
-        """Traite une question et retourne la réponse + métadonnées."""
+        """
+        Traite une question et retourne la réponse + métadonnées + suggestions vidéo.
+
+        Retour:
+            {
+                "response": str,          # Réponse textuelle
+                "context_docs": int,      # Nombre de chunks utilisés
+                "videos": list[dict],     # Vidéos YouTube pertinentes (peut être [])
+                "original_query": str,
+                "cached": bool,
+                "error": bool,            # Présent seulement si erreur
+            }
+        """
         cleaned = (query or "").strip()
         if not cleaned:
-            return {"response": "Veuillez saisir une question.", "error": True}
+            return {"response": "Veuillez saisir une question.", "error": True, "videos": []}
 
         if cached := self._cache_get(cleaned.lower()):
             logger.info("Cache hit")
@@ -229,31 +285,38 @@ class RAGPipeline:
             return {
                 "response": "Base vectorielle vide — lancez index_data.py puis réessayez.",
                 "error": True,
+                "videos": [],
             }
 
-        # Retrieval
+        # ── Recherche documentaire ────────────────────────────────────────────
         t0 = time.perf_counter()
         try:
             docs = self.vectorstore.similarity_search(cleaned, k=self.retrieval_k)
             context = self._build_context(docs)
             logger.info("Retrieval: {} docs en {:.3f}s", len(docs), time.perf_counter() - t0)
 
-            # ── Debug chunks ──────────────────────────────────────────────────────
             for i, doc in enumerate(docs, 1):
                 source = doc.metadata.get("source", "source inconnue")
                 preview = (doc.page_content or "").replace("\n", " ").strip()[:150]
                 logger.debug("Chunk {}/{} | source={} | apercu: {}...", i, len(docs), source, preview)
             logger.debug("Contexte total envoye au LLM: {} chars", len(context))
-            # ─────────────────────────────────────────────────────────────────────
 
         except Exception as exc:
             logger.error("Erreur retrieval: {}", exc)
-            return {"response": "Erreur lors de la recherche vectorielle.", "error": True}
+            return {"response": "Erreur lors de la recherche vectorielle.", "error": True, "videos": []}
 
         if not docs:
-            return {"response": "Aucun passage pertinent trouvé.", "context_docs": 0}
+            return {"response": "Aucun passage pertinent trouvé.", "context_docs": 0, "videos": []}
 
-        # Generation
+        # ── Recherche vidéo (parallèle en logique, séquentielle en pratique) ──
+        t_video = time.perf_counter()
+        videos = self._retrieve_videos(cleaned)
+        logger.info(
+            "Recherche vidéo: {} résultat(s) en {:.3f}s",
+            len(videos), time.perf_counter() - t_video,
+        )
+
+        # ── Génération LLM ────────────────────────────────────────────────────
         t1 = time.perf_counter()
         try:
             response = str(self.chain.invoke({"context": context, "question": cleaned})).strip()
@@ -266,9 +329,14 @@ class RAGPipeline:
                     f"(ollama pull {OLLAMA_MODEL})."
                 ),
                 "error": True,
+                "videos": videos,  # Retourner les vidéos même si la génération échoue
             }
 
-        payload = {"response": response, "context_docs": len(docs)}
+        payload = {
+            "response": response,
+            "context_docs": len(docs),
+            "videos": videos,
+        }
         self._cache_set(cleaned.lower(), payload)
         return {**payload, "original_query": query, "cached": False}
 

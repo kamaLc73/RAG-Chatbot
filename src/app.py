@@ -1,3 +1,11 @@
+"""
+src/app.py — Assistant RCAR/CNRA avec suggestions vidéos YouTube
+Modifications vs version originale:
+    - Les messages bot peuvent porter un champ "videos" (liste de dicts)
+    - render_video_cards() génère les cartes HTML cliquables
+    - Les cartes s'affichent sous la réponse textuelle
+"""
+
 import html
 import os
 import time
@@ -38,7 +46,7 @@ if "theme" not in st.session_state:
     st.session_state["theme"] = "dark"
 
 if "history" not in st.session_state:
-    st.session_state["history"] = [{"type": "bot", "content": get_welcome_message()}]
+    st.session_state["history"] = [{"type": "bot", "content": get_welcome_message(), "videos": []}]
 
 if "processing" not in st.session_state:
     st.session_state["processing"] = False
@@ -60,7 +68,7 @@ def toggle_theme() -> None:
     st.session_state["theme"] = "light" if st.session_state["theme"] == "dark" else "dark"
 
 
-# Theme variables adapted for RCAR/CNRA
+# Theme variables
 if st.session_state["theme"] == "dark":
     title_color = "#ffffff"
     subtitle_color = "#9dd7be"
@@ -71,6 +79,12 @@ if st.session_state["theme"] == "dark":
     spinner_color = "#d8f3e8"
     info_bg = "#18312a"
     info_color = "#d8f3e8"
+    video_card_bg = "#162a23"
+    video_card_border = "#2a5043"
+    video_card_title_color = "#9dd7be"
+    video_card_text_color = "#c5ddd5"
+    video_badge_bg = "#1f4a39"
+    video_badge_color = "#9dd7be"
 else:
     title_color = "#0f5132"
     subtitle_color = "#1f6e4a"
@@ -81,6 +95,12 @@ else:
     spinner_color = "#0f5132"
     info_bg = "#e5f0ea"
     info_color = "#1f5a41"
+    video_card_bg = "#e8f5ee"
+    video_card_border = "#a8d5bc"
+    video_card_title_color = "#0f5132"
+    video_card_text_color = "#2d5a42"
+    video_badge_bg = "#c5e8d4"
+    video_badge_color = "#0a3f27"
 
 
 theme_css = f"""
@@ -244,6 +264,82 @@ theme_css = f"""
         from, to {{ border-color: transparent; }}
         50% {{ border-color: {bot_msg_color}; }}
     }}
+
+    /* ── Cartes vidéo YouTube ─────────────────────────────────────────── */
+    .video-suggestions {{
+        margin-top: 12px;
+        max-width: 70%;
+    }}
+
+    .video-suggestions-label {{
+        font-size: 0.8rem;
+        font-weight: 600;
+        color: {video_badge_color};
+        background-color: {video_badge_bg};
+        display: inline-block;
+        padding: 2px 10px;
+        border-radius: 999px;
+        margin-bottom: 8px;
+        letter-spacing: 0.03em;
+    }}
+
+    .video-card {{
+        display: flex;
+        gap: 10px;
+        align-items: flex-start;
+        background-color: {video_card_bg};
+        border: 1px solid {video_card_border};
+        border-radius: 10px;
+        padding: 10px;
+        margin-bottom: 8px;
+        text-decoration: none;
+        transition: opacity 0.15s;
+    }}
+
+    .video-card:hover {{
+        opacity: 0.85;
+    }}
+
+    .video-card img {{
+        width: 100px;
+        height: 56px;
+        object-fit: cover;
+        border-radius: 6px;
+        flex-shrink: 0;
+    }}
+
+    .video-card-info {{
+        flex: 1;
+        min-width: 0;
+    }}
+
+    .video-card-title {{
+        font-size: 0.85rem;
+        font-weight: 600;
+        color: {video_card_title_color};
+        margin-bottom: 4px;
+        display: -webkit-box;
+        -webkit-line-clamp: 2;
+        -webkit-box-orient: vertical;
+        overflow: hidden;
+    }}
+
+    .video-card-excerpt {{
+        font-size: 0.75rem;
+        color: {video_card_text_color};
+        display: -webkit-box;
+        -webkit-line-clamp: 2;
+        -webkit-box-orient: vertical;
+        overflow: hidden;
+        opacity: 0.85;
+    }}
+
+    .video-card-icon {{
+        font-size: 0.75rem;
+        color: {video_card_text_color};
+        margin-top: 4px;
+        opacity: 0.7;
+    }}
 </style>
 """
 
@@ -260,7 +356,7 @@ with st.sidebar:
     st.markdown("---")
     st.markdown("### Reinitialisation")
     if st.button("Effacer l'historique", help="Reinitialise la conversation", type="secondary"):
-        st.session_state["history"] = [{"type": "bot", "content": get_welcome_message()}]
+        st.session_state["history"] = [{"type": "bot", "content": get_welcome_message(), "videos": []}]
         st.session_state["show_typewriter"] = False
         st.session_state["typewriter_message"] = ""
         st.session_state["processing"] = False
@@ -288,10 +384,8 @@ def load_rag_pipeline() -> RAGPipeline:
 
 
 def preload_rag_pipeline() -> None:
-    """Initialize embeddings/vectorstore at startup to reduce first-question latency."""
     if st.session_state["rag_preload_attempted"]:
         return
-
     st.session_state["rag_preload_attempted"] = True
     try:
         load_rag_pipeline()
@@ -306,18 +400,53 @@ def render_plain_text(text: str) -> str:
     """Convertit le texte en HTML lisible, en nettoyant le Markdown résiduel."""
     if not text:
         return ""
-    
-    # Supprimer le Markdown résiduel que le LLM aurait quand même généré
-    text = re.sub(r'\*\*(.*?)\*\*', r'\1', text)   # **gras** → texte
-    text = re.sub(r'\*(.*?)\*', r'\1', text)         # *italique* → texte
-    text = re.sub(r'#{1,6}\s*', '', text)            # ### Titre → Titre
-    text = re.sub(r'`{1,3}(.*?)`{1,3}', r'\1', text, flags=re.DOTALL)  # `code` → texte
-    text = re.sub(r'---+', '─' * 30, text)           # --- → ligne lisible
-    
-    # Échapper le HTML puis remettre les sauts de ligne
+    text = re.sub(r'\*\*(.*?)\*\*', r'\1', text)
+    text = re.sub(r'\*(.*?)\*', r'\1', text)
+    text = re.sub(r'#{1,6}\s*', '', text)
+    text = re.sub(r'`{1,3}(.*?)`{1,3}', r'\1', text, flags=re.DOTALL)
+    text = re.sub(r'---+', '─' * 30, text)
     text = html.escape(text)
     text = text.replace("\n", "<br>")
     return text
+
+
+def render_video_cards(videos: list[dict]) -> str:
+    """
+    Génère le HTML pour les cartes vidéo YouTube.
+    Chaque carte est un lien cliquable vers la vidéo avec thumbnail + titre + excerpt.
+    """
+    if not videos:
+        return ""
+
+    cards_html = '<div class="video-suggestions">'
+    cards_html += '<div class="video-suggestions-label">▶ Vidéos suggérées</div>'
+
+    for video in videos:
+        title = html.escape(video.get("title", "Vidéo CNRA/RCAR"))
+        url = html.escape(video.get("url", "#"))
+        thumbnail = html.escape(
+            video.get(
+                "thumbnail_url",
+                f"https://img.youtube.com/vi/{video.get('video_id', '')}/mqdefault.jpg",
+            )
+        )
+        excerpt = html.escape((video.get("excerpt") or "")[:120])
+        if excerpt:
+            excerpt += "..."
+
+        cards_html += f"""
+        <a href="{url}" target="_blank" rel="noopener noreferrer" class="video-card">
+            <img src="{thumbnail}" alt="Miniature" loading="lazy"
+                 onerror="this.style.display='none'">
+            <div class="video-card-info">
+                <div class="video-card-title">{title}</div>
+                {"<div class='video-card-excerpt'>" + excerpt + "</div>" if excerpt else ""}
+                <div class="video-card-icon">▶ Voir sur YouTube</div>
+            </div>
+        </a>"""
+
+    cards_html += "</div>"
+    return cards_html
 
 
 def stream_typewriter(text: str, placeholder, delay: float = 0.012) -> None:
@@ -390,6 +519,13 @@ with chat_container:
                         unsafe_allow_html=True,
                     )
 
+                # ── Cartes vidéo (sous la réponse textuelle) ──────────────────
+                videos = message.get("videos") or []
+                if videos and message["content"] and not is_typing_message:
+                    video_html = render_video_cards(videos)
+                    if video_html:
+                        st.markdown(video_html, unsafe_allow_html=True)
+
                 if i < len(st.session_state["history"]) - 1:
                     st.markdown("<div class='message-separator'></div>", unsafe_allow_html=True)
 
@@ -444,12 +580,14 @@ if submit and user_input and not st.session_state["processing"]:
         "type": "user",
         "content": user_input,
         "timestamp": time.time(),
+        "videos": [],
     }
 
     bot_message = {
         "type": "bot",
         "content": "",
         "timestamp": time.time(),
+        "videos": [],
     }
 
     st.session_state["history"].extend([user_message, bot_message])
@@ -474,18 +612,24 @@ if (
         try:
             rag = load_rag_pipeline()
             result = rag.query(query=last_question)
-            logger.info(result) 
+            logger.info(result)
+
             if isinstance(result, dict):
                 response = result.get("response") or result.get("answer") or str(result)
+                videos = result.get("videos") or []
             else:
                 response = str(result)
+                videos = []
 
-            logger.info("Reponse UI recue | chars={}", len(response or ""))
+            logger.info("Reponse UI recue | chars={} | videos={}", len(response or ""), len(videos))
         except Exception as e:
             logger.error("Erreur lors de la generation de la reponse : {}", e)
             response = "Une erreur est survenue lors de la generation de la reponse. Veuillez reessayer."
+            videos = []
 
+        # Mettre à jour le dernier message bot avec réponse + vidéos
         st.session_state["history"][-1]["content"] = response
+        st.session_state["history"][-1]["videos"] = videos
         st.session_state["show_typewriter"] = True
         st.session_state["typewriter_message"] = response
         st.session_state["processing"] = False
