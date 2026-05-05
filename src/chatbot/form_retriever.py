@@ -187,6 +187,11 @@ class FormRetriever:
         # 1. Recherche vectorielle
         try:
             docs = self.vectorstore.similarity_search(query, k=self.top_k_retrieve)
+            logger.debug("--- CHUNKS RECUPÉRÉS AVANT RERANKING ---")
+            for i, doc in enumerate(docs):
+                title = doc.metadata.get("title", "Unknown")
+                fid = doc.metadata.get("form_id", "")
+                logger.debug("  [{}] Formulaire: '{}' (ID: {})", i + 1, title, fid)
         except Exception as exc:
             logger.error("Erreur recherche formulaires: {}", exc)
             return []
@@ -199,6 +204,9 @@ class FormRetriever:
             pairs = [(query, doc.page_content[:600]) for doc in docs]
             try:
                 scores = self.reranker.predict(pairs).tolist()
+                logger.debug("--- SCORES APRÈS RERANKING ---")
+                for i, (doc, score) in enumerate(zip(docs, scores)):
+                    logger.debug("  [{}] Score: {:.4f} | Formulaire: '{}'", i + 1, score, doc.metadata.get("title", ""))
             except Exception as exc:
                 logger.warning("Reranker erreur: {} — fallback scores vectoriels", exc)
                 scores = [0.5] * len(docs)

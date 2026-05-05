@@ -10,6 +10,7 @@ import streamlit as st
 from loguru import logger
 
 from chatbot.rag_pipeline import RAGPipeline
+from audio.transcriber import AudioTranscriber
 from config.logger import setup_logger
 from config.settings import LOGS_DIR
 
@@ -40,6 +41,10 @@ if "show_typewriter"   not in st.session_state: st.session_state["show_typewrite
 if "typewriter_message" not in st.session_state: st.session_state["typewriter_message"] = ""
 if "rag_preload_attempted" not in st.session_state: st.session_state["rag_preload_attempted"] = False
 if "rag_preload_error"     not in st.session_state: st.session_state["rag_preload_error"] = ""
+if "transcriber_preload_attempted" not in st.session_state: st.session_state["transcriber_preload_attempted"] = False
+if "transcriber_preload_error"     not in st.session_state: st.session_state["transcriber_preload_error"] = ""
+if "last_audio_id"         not in st.session_state: st.session_state["last_audio_id"] = None
+if "voice_query"           not in st.session_state: st.session_state["voice_query"] = ""
 
 
 def toggle_theme() -> None:
@@ -246,6 +251,23 @@ def load_rag_pipeline() -> RAGPipeline:
         return RAGPipeline()
 
 
+@st.cache_resource
+def load_transcriber() -> AudioTranscriber:
+    return AudioTranscriber(model_size="small", language="fr")
+
+
+def preload_transcriber() -> None:
+    if st.session_state["transcriber_preload_attempted"]:
+        return
+    st.session_state["transcriber_preload_attempted"] = True
+    try:
+        with st.spinner("Préchargement du module vocal..."):
+            load_transcriber()
+    except Exception as exc:
+        st.session_state["transcriber_preload_error"] = str(exc)
+        logger.error("Erreur préchargement Whisper: {}", exc)
+
+
 def preload_rag_pipeline() -> None:
     if st.session_state["rag_preload_attempted"]:
         return
@@ -360,6 +382,7 @@ def stream_typewriter(text: str, placeholder, delay: float = 0.012) -> None:
 
 
 preload_rag_pipeline()
+preload_transcriber()
 
 # ── Historique ────────────────────────────────────────────────────────────────
 with st.container():
@@ -419,13 +442,14 @@ if st.session_state["processing"]:
             unsafe_allow_html=True,
         )
 
-# ── Formulaire de saisie ──────────────────────────────────────────────────────
+# ── Zone de saisie (texte + micro) ───────────────────────────────────────────
 st.markdown('<div class="form-container">', unsafe_allow_html=True)
+
+# Micro — au-dessus du champ texte, label caché mais non vide (accessibilité)
+audio_value = st.audio_input("Message vocal", key="mic_input", label_visibility="collapsed")
+
+# Formulaire texte
 with st.form(key="chat_form", clear_on_submit=True):
-    st.markdown(
-        f"<label style='color:{title_color};font-weight:500;margin-bottom:8px;display:block;'>Votre question :</label>",
-        unsafe_allow_html=True,
-    )
     user_input = st.text_input(
         "Votre question", key="input_field",
         label_visibility="collapsed",
@@ -434,10 +458,29 @@ with st.form(key="chat_form", clear_on_submit=True):
     c1, c2 = st.columns([1, 6])
     with c1:
         submit = st.form_submit_button(
-            "Envoyer", help="Envoyer votre question",
+            "Envoyer",
             disabled=st.session_state["processing"],
         )
 st.markdown("</div>", unsafe_allow_html=True)
+
+# Traitement audio — détection d'un nouvel enregistrement
+if audio_value is not None:
+    audio_id = hash(audio_value.read())
+    audio_value.seek(0)
+    if audio_id != st.session_state["last_audio_id"] and not st.session_state["processing"]:
+        st.session_state["last_audio_id"] = audio_id
+        with st.spinner("Transcription en cours..."):
+            transcribed = load_transcriber().transcribe(audio_value.read())
+        if transcribed:
+            st.session_state["processing"] = True
+            st.session_state["show_typewriter"] = False
+            st.session_state["history"].extend([
+                {"type": "user", "content": transcribed, "videos": [], "forms": []},
+                {"type": "bot",  "content": "",          "videos": [], "forms": []},
+            ])
+            st.rerun()
+        else:
+            st.warning("Aucun texte détecté — réessayez.")
 
 
 # ── Soumission ────────────────────────────────────────────────────────────────

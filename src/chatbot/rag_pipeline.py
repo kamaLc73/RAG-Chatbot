@@ -1,16 +1,21 @@
 """
 src/chatbot/rag_pipeline.py
 ============================
-Pipeline RAG principal + suggestions vidéos YouTube + suggestions formulaires.
+Pipeline RAG principal + reranking sur chroma_db + suggestions vidéos + formulaires.
+
+Flux de retrieval documentaire (NOUVEAU) :
+    1. similarity_search(k=RAG_RETRIEVE_K)   → 12 candidats vectoriels
+    2. shared_reranker.predict()              → score cross-encoder sur chaque candidat
+    3. tri décroissant → top RAG_FINAL_K=4   → chunks envoyés au LLM
 
 Champs retournés par query() :
     {
-        "response":      str,        # Réponse textuelle
-        "context_docs":  int,        # Chunks documentaires utilisés
-        "videos":        list[dict], # Vidéos YouTube pertinentes
-        "forms":         list[dict], # Formulaires CNRA/RCAR pertinents
+        "response":       str,
+        "context_docs":   int,        # nombre de chunks après reranking
+        "videos":         list[dict],
+        "forms":          list[dict],
         "original_query": str,
-        "cached":        bool,
+        "cached":         bool,
     }
 """
 
@@ -57,7 +62,6 @@ if str(src_root) not in sys.path:
 from config.logger import setup_logger
 from config.settings import BASE_DIR, LOGS_DIR
 
-# ── Retrievers optionnels ─────────────────────────────────────────────────────
 try:
     from chatbot.video_retriever import VideoRetriever
     _VIDEO_RETRIEVER_AVAILABLE = True
@@ -76,6 +80,7 @@ load_dotenv(BASE_DIR / ".env")
 
 VECTORSTORE_RELATIVE_PATH = Path("data") / "vectorstore" / "chroma_db"
 DEFAULT_EMBEDDING_MODEL   = "BAAI/bge-m3"
+RERANKER_MODEL            = "BAAI/bge-reranker-v2-m3"
 HF_TOKEN = getenv("HF_TOKEN", "").strip().strip('"\'')
 
 OLLAMA_MODEL       = getenv("OLLAMA_MODEL", "mistral:latest").strip().strip('"\'')
@@ -86,7 +91,12 @@ OLLAMA_NUM_PREDICT = 600
 OLLAMA_NUM_CTX     = 4096
 OLLAMA_KEEP_ALIVE  = "30m"
 
-RAG_TOP_K             = 4
+# ── Paramètres retrieval principal ────────────────────────────────────────────
+# RAG_RETRIEVE_K : candidats récupérés par similarity_search (pool pour le reranker)
+# RAG_FINAL_K    : chunks conservés après reranking → envoyés au LLM
+# Règle : RAG_RETRIEVE_K >= RAG_FINAL_K (typiquement 3x)
+RAG_RETRIEVE_K        = 12    # Était RAG_TOP_K = 4 — élargi pour donner du choix au reranker
+RAG_FINAL_K           = 4     # Chunks finaux après reranking
 RAG_MAX_CONTEXT_CHARS = 2800
 RAG_MAX_DOC_CHARS     = 700
 RAG_CACHE_SIZE        = 100
@@ -107,62 +117,60 @@ class RAGPipeline:
             resolved_path = (BASE_DIR / resolved_path).resolve()
 
         self.collection_name   = collection_name
-        self.retrieval_k       = RAG_TOP_K
+        self.retrieval_k       = RAG_RETRIEVE_K
+        self.final_k           = RAG_FINAL_K
         self.max_context_chars = RAG_MAX_CONTEXT_CHARS
         self.max_doc_chars     = RAG_MAX_DOC_CHARS
         self.response_cache: OrderedDict = OrderedDict()
 
         logger.info("VectorStore: {} (collection={})", resolved_path, collection_name)
 
-        # ── Embeddings ────────────────────────────────────────────────────────
+        # ── Device ────────────────────────────────────────────────────────────
         try:
             device = "cuda" if (torch and torch.cuda.is_available()) else "cpu"
         except Exception:
             device = "cpu"
 
+        # ── Embeddings (instance unique partagée) ─────────────────────────────
         logger.info("Embedding: {} sur {}", embedding_model, device)
-        model_kwargs = {
-            "device": device,
-        }
-        
+        model_kwargs: dict = {"device": device}
         if HF_TOKEN:
             model_kwargs["token"] = HF_TOKEN
 
-        # ✅ Instance unique partagée : batch_size=32 pour exploiter la GPU
         self.embeddings = HuggingFaceEmbeddings(
             model_name=embedding_model,
             model_kwargs=model_kwargs,
             encode_kwargs={"normalize_embeddings": True, "batch_size": 32},
         )
-        
-        # ✅ FP16 casting après chargement (réduit ~570MB → ~285MB VRAM)
+
+        # FP16 sur GPU : −50% VRAM, ~+20% throughput
         try:
-            if device == "cuda" and hasattr(self.embeddings, "client") and self.embeddings.client is not None:
-                if hasattr(self.embeddings.client, "model") and self.embeddings.client.model is not None:
+            if device == "cuda" and hasattr(self.embeddings, "client"):
+                if hasattr(self.embeddings.client, "model"):
                     self.embeddings.client.model.half()
-                    logger.info("Embeddings castées en FP16 (GPU) — économie VRAM")
+                    logger.info("Embeddings castées en FP16 (GPU)")
         except Exception as exc:
             logger.debug("Embeddings FP16 cast échoué (fallback FP32): {}", exc)
-        
+
         self._warm_up_embeddings()
 
-        # ✅ Reranker unique partagé avec FP16 sur GPU
-        self.shared_reranker = None
+        # ── Reranker (instance unique partagée) ───────────────────────────────
+        self.shared_reranker: CrossEncoder | None = None
         try:
             self.shared_reranker = CrossEncoder(
-                "BAAI/bge-reranker-v2-m3",
+                RERANKER_MODEL,
                 max_length=512,
                 device=device,
             )
-            # Cast en FP16 sur GPU pour ×1.5-2 de speedup et −850MB VRAM
             if device == "cuda" and self.shared_reranker.model is not None:
                 try:
                     self.shared_reranker.model.half()
-                    logger.info("Reranker castée en FP16 (GPU)")
+                    logger.info("Reranker casté en FP16 (GPU)")
                 except Exception as exc:
                     logger.debug("Reranker FP16 cast échoué: {}", exc)
+            logger.info("Reranker chargé: {} sur {}", RERANKER_MODEL, device)
         except Exception as exc:
-            logger.warning("Reranker non disponible ({}), mode fallback activé", exc)
+            logger.warning("Reranker non disponible ({}), fallback scores vectoriels", exc)
 
         # ── VectorStore principal ─────────────────────────────────────────────
         self.vectorstore = Chroma(
@@ -175,44 +183,40 @@ class RAGPipeline:
         if self.collection_count == 0:
             logger.warning("Collection vide — lancez index_data.py pour l'indexation.")
 
-        # ── VideoRetriever (optionnel) ────────────────────────────────────────
+        # ── VideoRetriever (instance partagée) ────────────────────────────────
         self.video_retriever = None
         if enable_video_suggestions and _VIDEO_RETRIEVER_AVAILABLE:
             try:
-                # ✅ Injection des instances partagées (pas de re-chargement)
                 self.video_retriever = VideoRetriever(
                     shared_embeddings=self.embeddings,
                     shared_reranker=self.shared_reranker,
                 )
-                if self.video_retriever.available:
-                    logger.info("Suggestions vidéo YouTube : activées")
-                else:
-                    logger.info("Suggestions vidéo YouTube : désactivées (lance index_videos.py)")
+                logger.info(
+                    "Suggestions vidéo : {}",
+                    "activées" if self.video_retriever.available else "désactivées (lance index_videos.py)",
+                )
             except Exception as exc:
                 logger.warning("VideoRetriever init échoué: {}", exc)
 
-        # ── FormRetriever (optionnel) ─────────────────────────────────────────
+        # ── FormRetriever (instance partagée) ─────────────────────────────────
         self.form_retriever = None
         if enable_form_suggestions and _FORM_RETRIEVER_AVAILABLE:
             try:
-                # ✅ Injection des instances partagées (pas de re-chargement)
                 self.form_retriever = FormRetriever(
                     shared_embeddings=self.embeddings,
                     shared_reranker=self.shared_reranker,
                 )
-                if self.form_retriever.available:
-                    logger.info("Suggestions formulaires : activées")
-                else:
-                    logger.info("Suggestions formulaires : désactivées (lance index_forms.py)")
+                logger.info(
+                    "Suggestions formulaires : {}",
+                    "activées" if self.form_retriever.available else "désactivées (lance index_forms.py)",
+                )
             except Exception as exc:
                 logger.warning("FormRetriever init échoué: {}", exc)
 
         # ── LLM ───────────────────────────────────────────────────────────────
-        is_cloud    = "ollama.com" in OLLAMA_BASE_URL
         client_kwargs = (
             {"headers": {"Authorization": f"Bearer {OLLAMA_API_KEY}"}} if OLLAMA_API_KEY else None
         )
-
         llm_kwargs = dict(
             model=local_model,
             base_url=OLLAMA_BASE_URL,
@@ -275,7 +279,7 @@ class RAGPipeline:
         except Exception as exc:
             logger.warning("Warmup ignoré: {}", exc)
 
-    def _build_context(self, docs) -> str:
+    def _build_context(self, docs: list) -> str:
         parts, total = [], 0
         for doc in docs:
             chunk = (doc.page_content or "")[: self.max_doc_chars]
@@ -296,6 +300,59 @@ class RAGPipeline:
         self.response_cache.move_to_end(key)
         while len(self.response_cache) > RAG_CACHE_SIZE:
             self.response_cache.popitem(last=False)
+
+    def _retrieve_and_rerank_docs(self, query: str) -> list:
+        """
+        Recherche vectorielle sur chroma_db + reranking cross-encoder.
+
+        Étapes :
+          1. similarity_search(k=RAG_RETRIEVE_K)  → pool de candidats (défaut 12)
+          2. shared_reranker.predict()             → score pertinence de chaque chunk
+          3. tri + top RAG_FINAL_K                 → chunks finaux (défaut 4)
+
+        Si le reranker est indisponible, retourne les RAG_FINAL_K premiers
+        résultats vectoriels (comportement identique à avant).
+        """
+        # Étape 1 — pool vectoriel élargi
+        candidates = self.vectorstore.similarity_search(query, k=self.retrieval_k)
+
+        if not candidates:
+            return []
+
+        # Étape 2 — reranking (si disponible)
+        if self.shared_reranker is not None:
+            pairs = [(query, doc.page_content[:600]) for doc in candidates]
+            try:
+                scores = self.shared_reranker.predict(pairs).tolist()
+
+                # Log debug : montre l'ordre avant/après reranking
+                logger.debug("── Reranking chroma_db ({} candidats) ──", len(candidates))
+                ranked = sorted(
+                    zip(scores, candidates),
+                    key=lambda x: x[0],
+                    reverse=True,
+                )
+                for i, (sc, doc) in enumerate(ranked):
+                    src = doc.metadata.get("relative_source", doc.metadata.get("source", "?"))
+                    logger.debug(
+                        "  [{}/{}] score={:.4f} | {}",
+                        i + 1, len(ranked), sc,
+                        src.split("/")[-1][:60] if src else "?"
+                    )
+
+                # Étape 3 — top-K après reranking
+                top_docs = [doc for _, doc in ranked[: self.final_k]]
+                logger.info(
+                    "Reranking docs: {} candidats → {} retenus (meilleur score: {:.4f})",
+                    len(candidates), len(top_docs), ranked[0][0] if ranked else 0,
+                )
+                return top_docs
+
+            except Exception as exc:
+                logger.warning("Reranker erreur sur chroma_db ({}), fallback vectoriel", exc)
+
+        # Fallback : pas de reranker → top RAG_FINAL_K résultats vectoriels
+        return candidates[: self.final_k]
 
     def _retrieve_videos(self, query: str) -> list[dict]:
         if not self.video_retriever or not self.video_retriever.available:
@@ -319,7 +376,10 @@ class RAGPipeline:
 
     def query(self, query: str) -> dict:
         """
-        Traite une question. Retourne réponse + vidéos + formulaires.
+        Traite une question utilisateur.
+
+        Retourne :
+            response, context_docs, videos, forms, original_query, cached
         """
         cleaned = (query or "").strip()
         if not cleaned:
@@ -331,17 +391,18 @@ class RAGPipeline:
         if self.collection_count == 0:
             return {
                 "response": "Base vectorielle vide — lancez index_data.py puis réessayez.",
-                "error": True,
-                "videos": [],
-                "forms":  [],
+                "error": True, "videos": [], "forms": [],
             }
 
-        # ── Recherche documentaire ────────────────────────────────────────────
+        # ── Retrieval + reranking documentaire ───────────────────────────────
         t0 = time.perf_counter()
         try:
-            docs    = self.vectorstore.similarity_search(cleaned, k=self.retrieval_k)
+            docs    = self._retrieve_and_rerank_docs(cleaned)
             context = self._build_context(docs)
-            logger.info("Retrieval: {} docs en {:.3f}s", len(docs), time.perf_counter() - t0)
+            logger.info(
+                "Retrieval+reranking docs: {} chunks en {:.3f}s",
+                len(docs), time.perf_counter() - t0,
+            )
         except Exception as exc:
             logger.error("Erreur retrieval: {}", exc)
             return {"response": "Erreur lors de la recherche.", "error": True, "videos": [], "forms": []}
@@ -349,27 +410,23 @@ class RAGPipeline:
         if not docs:
             return {"response": "Aucun passage pertinent trouvé.", "context_docs": 0, "videos": [], "forms": []}
 
-        # ── Recherche vidéos + formulaires en parallèle ────────────────────────
-        # ✅ Optimisation : exécution parallèle au lieu de séquentielle
-        # Les deux retrievals font de l'I/O + inférence indépendants
+        # ── Vidéos + formulaires en parallèle ─────────────────────────────────
         videos, forms = [], []
-        t_parallel_start = time.perf_counter()
-        
+        t_par = time.perf_counter()
         try:
             with ThreadPoolExecutor(max_workers=2) as pool:
-                fut_videos = pool.submit(self._retrieve_videos, cleaned)
-                fut_forms = pool.submit(self._retrieve_forms, cleaned)
-                videos = fut_videos.result(timeout=30)
-                forms = fut_forms.result(timeout=30)
-            t_parallel_elapsed = time.perf_counter() - t_parallel_start
+                fut_v = pool.submit(self._retrieve_videos, cleaned)
+                fut_f = pool.submit(self._retrieve_forms, cleaned)
+                videos = fut_v.result(timeout=30)
+                forms  = fut_f.result(timeout=30)
             logger.info(
                 "Parallel retrieval: vidéos={} formulaires={} en {:.3f}s",
-                len(videos), len(forms), t_parallel_elapsed
+                len(videos), len(forms), time.perf_counter() - t_par,
             )
         except Exception as exc:
             logger.warning("Parallel retrieval échoué (fallback séquentiel): {}", exc)
             videos = self._retrieve_videos(cleaned)
-            forms = self._retrieve_forms(cleaned)
+            forms  = self._retrieve_forms(cleaned)
 
         # ── Génération LLM ────────────────────────────────────────────────────
         t1 = time.perf_counter()
@@ -380,9 +437,7 @@ class RAGPipeline:
             logger.error("Erreur génération: {}", exc)
             return {
                 "response": f"Erreur de génération. Vérifiez qu'Ollama est lancé (ollama pull {OLLAMA_MODEL}).",
-                "error": True,
-                "videos": videos,
-                "forms":  forms,
+                "error": True, "videos": videos, "forms": forms,
             }
 
         payload = {
