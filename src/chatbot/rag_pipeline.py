@@ -3,21 +3,26 @@ src/chatbot/rag_pipeline.py
 ============================
 Pipeline RAG principal + reranking sur chroma_db + suggestions vidéos + formulaires.
 
-Flux de retrieval documentaire (NOUVEAU) :
+Flux de retrieval documentaire :
     1. similarity_search(k=RAG_RETRIEVE_K)   → 12 candidats vectoriels
     2. shared_reranker.predict()              → score cross-encoder sur chaque candidat
     3. tri décroissant → top RAG_FINAL_K=4   → chunks envoyés au LLM
 
-Champs retournés par query() :
+Champs retournés par query() — TOUJOURS présents (succès ET erreur) :
     {
-        "response":       str,
-        "context_docs":   int,        # nombre de chunks après reranking
-        "videos":         list[dict],
-        "forms":          list[dict],
-        "original_query": str,
-        "cached":         bool,
+        "response":          str,
+        "context_docs":      int,        # nombre de chunks après reranking
+        "videos":            list[dict],
+        "forms":             list[dict],
+        "intent":            str,        # intent classifié (défaut: "retrieval")
+        "intent_confidence": float,      # score cosinus moyen (défaut: 0.0)
+        "original_query":    str,
+        "cached":            bool,
+        "error":             bool,       # présent uniquement si True
     }
 """
+# ── Compatibilité Python 3.8+ pour les annotations de type ───────────────────
+from __future__ import annotations
 
 import os
 import sys
@@ -102,7 +107,7 @@ OLLAMA_KEEP_ALIVE  = "30m"
 # RAG_RETRIEVE_K : candidats récupérés par similarity_search (pool pour le reranker)
 # RAG_FINAL_K    : chunks conservés après reranking → envoyés au LLM
 # Règle : RAG_RETRIEVE_K >= RAG_FINAL_K (typiquement 3x)
-RAG_RETRIEVE_K        = 12    # Était RAG_TOP_K = 4 — élargi pour donner du choix au reranker
+RAG_RETRIEVE_K        = 12    # Pool élargi pour donner du choix au reranker
 RAG_FINAL_K           = 4     # Chunks finaux après reranking
 RAG_MAX_CONTEXT_CHARS = 2800
 RAG_MAX_DOC_CHARS     = 700
@@ -161,7 +166,7 @@ class RAGPipeline:
 
         self._warm_up_embeddings()
 
-        # ── Intent Classifier (instance partagée, réutilise les embeddings) ──
+        # ── Intent Classifier (réutilise les embeddings partagés) ─────────────
         self.intent_classifier: IntentClassifier | None = None
         if _INTENT_CLASSIFIER_AVAILABLE:
             try:
@@ -175,6 +180,8 @@ class RAGPipeline:
                 )
             except Exception as exc:
                 logger.warning("IntentClassifier init échoué: {} — gate désactivé", exc)
+
+        # ── Reranker (instance unique partagée) ───────────────────────────────
         self.shared_reranker: CrossEncoder | None = None
         try:
             self.shared_reranker = CrossEncoder(
@@ -265,6 +272,34 @@ class RAGPipeline:
         except Exception:
             return 0
 
+    def _error_response(
+        self,
+        message: str,
+        original_query: str = "",
+        *,
+        videos: list | None = None,
+        forms: list | None = None,
+        intent: str = "retrieval",
+        intent_confidence: float = 0.0,
+        context_docs: int = 0,
+    ) -> dict:
+        """
+        Construit un payload d'erreur uniforme, avec TOUTES les clés du
+        payload nominal. Évite les KeyError côté appelant si l'accès se
+        fait sans .get().
+        """
+        return {
+            "response":          message,
+            "error":             True,
+            "context_docs":      context_docs,
+            "videos":            videos or [],
+            "forms":             forms or [],
+            "intent":            intent,
+            "intent_confidence": intent_confidence,
+            "original_query":    original_query,
+            "cached":            False,
+        }
+
     def _system_prompt(self) -> str:
         return """Vous etes un assistant virtuel officiel specialise dans les organismes de retraite et d'assurance marocains RCAR et CNRA.
 
@@ -305,17 +340,23 @@ class RAGPipeline:
 
     def _build_supplementary_hint(self, videos: list, forms: list) -> str:
         """
-        Construit un hint textuel informant le LLM des ressources disponibles
-        (vidéos et formulaires trouvés). Évite que le LLM dise "je n'ai pas de
-        vidéo/formulaire" alors qu'ils sont affichés dans l'interface.
+        Informe le LLM des ressources disponibles (vidéos et formulaires).
+        Évite que le LLM réponde "je n'ai pas de vidéo/formulaire" alors
+        qu'ils sont affichés dans l'interface.
         """
         parts = []
         if videos:
             titles = ", ".join(f'"{v.get("title", "vidéo")}"' for v in videos[:2])
-            parts.append(f"Des videos YouTube pertinentes sont disponibles pour cette question ({titles}). Elles seront affichees a l'utilisateur.")
+            parts.append(
+                f"Des videos YouTube pertinentes sont disponibles pour cette question "
+                f"({titles}). Elles seront affichees a l'utilisateur."
+            )
         if forms:
             titles = ", ".join(f'"{f.get("title", "formulaire")}"' for f in forms[:2])
-            parts.append(f"Des formulaires PDF sont disponibles ({titles}). Ils seront affiches a l'utilisateur avec un lien de telechargement.")
+            parts.append(
+                f"Des formulaires PDF sont disponibles ({titles}). Ils seront affiches "
+                f"a l'utilisateur avec un lien de telechargement."
+            )
         if not parts:
             return "Aucune video ni formulaire n'a ete trouve pour cette question."
         return " ".join(parts)
@@ -370,7 +411,6 @@ class RAGPipeline:
             try:
                 scores = self.shared_reranker.predict(pairs).tolist()
 
-                # Log debug : montre l'ordre avant/après reranking
                 logger.debug("── Reranking chroma_db ({} candidats) ──", len(candidates))
                 ranked = sorted(
                     zip(scores, candidates),
@@ -423,21 +463,29 @@ class RAGPipeline:
         """
         Traite une question utilisateur.
 
-        Retourne :
-            response, context_docs, videos, forms, original_query, cached
+        Retourne TOUJOURS un dict avec les clés :
+            response, context_docs, videos, forms, intent, intent_confidence,
+            original_query, cached.
+        La clé "error": True est ajoutée en cas d'échec.
         """
         cleaned = (query or "").strip()
         if not cleaned:
-            return {"response": "Veuillez saisir une question.", "error": True, "videos": [], "forms": []}
+            return self._error_response(
+                "Veuillez saisir une question.",
+                query,
+            )
 
-        if cached := self._cache_get(cleaned.lower()):
-            return {**cached, "original_query": query, "cached": True}
+        # ── Cache ─────────────────────────────────────────────────────────────
+        # Renommé 'hit' pour éviter la collision de nom avec la clé "cached"
+        # du payload retourné dans le dict déballé juste après.
+        if hit := self._cache_get(cleaned.lower()):
+            return {**hit, "original_query": query, "cached": True}
 
         if self.collection_count == 0:
-            return {
-                "response": "Base vectorielle vide — lancez index_data.py puis réessayez.",
-                "error": True, "videos": [], "forms": [],
-            }
+            return self._error_response(
+                "Base vectorielle vide — lancez index_data.py puis réessayez.",
+                query,
+            )
 
         # ── Retrieval + reranking documentaire ───────────────────────────────
         t0 = time.perf_counter()
@@ -450,10 +498,14 @@ class RAGPipeline:
             )
         except Exception as exc:
             logger.error("Erreur retrieval: {}", exc)
-            return {"response": "Erreur lors de la recherche.", "error": True, "videos": [], "forms": []}
+            return self._error_response("Erreur lors de la recherche.", query)
 
         if not docs:
-            return {"response": "Aucun passage pertinent trouvé.", "context_docs": 0, "videos": [], "forms": []}
+            return self._error_response(
+                "Aucun passage pertinent trouvé.",
+                query,
+                context_docs=0,
+            )
 
         # ── Intent classification + gate retrievers ───────────────────────────
         videos, forms = [], []
@@ -503,27 +555,32 @@ class RAGPipeline:
         # ── Génération LLM ────────────────────────────────────────────────────
         t1 = time.perf_counter()
         try:
-            # Inform the LLM about any supplementary resources (videos / forms)
             supplementary_hint = self._build_supplementary_hint(videos, forms)
             response = str(self.chain.invoke({
-                "context": context,
-                "question": cleaned,
+                "context":            context,
+                "question":           cleaned,
                 "supplementary_hint": supplementary_hint,
             })).strip()
             logger.info("Generation: {:.3f}s | {} chars", time.perf_counter() - t1, len(response))
         except Exception as exc:
             logger.error("Erreur génération: {}", exc)
-            return {
-                "response": f"Erreur de génération. Vérifiez qu'Ollama est lancé (ollama pull {OLLAMA_MODEL}).",
-                "error": True, "videos": videos, "forms": forms,
-            }
+            return self._error_response(
+                f"Erreur de génération. Vérifiez qu'Ollama est lancé (ollama pull {OLLAMA_MODEL}).",
+                query,
+                videos=videos,
+                forms=forms,
+                intent=classification.get("intent", "retrieval"),
+                intent_confidence=classification.get("confidence", 0.0),
+                context_docs=len(docs),
+            )
 
+        # ── Payload nominal ───────────────────────────────────────────────────
         payload = {
-            "response":     response,
-            "context_docs": len(docs),
-            "videos":       videos,
-            "forms":        forms,
-            "intent":       classification.get("intent", "retrieval"),
+            "response":          response,
+            "context_docs":      len(docs),
+            "videos":            videos,
+            "forms":             forms,
+            "intent":            classification.get("intent", "retrieval"),
             "intent_confidence": classification.get("confidence", 0.0),
         }
         self._cache_set(cleaned.lower(), payload)

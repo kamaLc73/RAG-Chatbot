@@ -45,10 +45,14 @@ Intents disponibles (classés par tier) :
     needs_form            Demandes explicites de formulaires ou documents à remplir
     needs_video           Demandes explicites de vidéos explicatives
 
-Utilisation :
+Utilisation normale (pipeline complet) :
     classifier = IntentClassifier(shared_embeddings=pipeline.embeddings)
     result = classifier.classify("je veux télécharger le formulaire de pension")
     # → {"intent": "needs_form", "confidence": 0.87, "tier": 4, "reasoning": "..."}
+
+Utilisation standalone (tests, debug) :
+    classifier = IntentClassifier()  # charge BGE-M3 seul, log d'avertissement
+    result = classifier.classify("bonjour")
 
 Gate vidéo/formulaire dans rag_pipeline.py :
     RETRIEVER_INTENTS = {
@@ -56,12 +60,14 @@ Gate vidéo/formulaire dans rag_pipeline.py :
         "form":  {"needs_form", "procedural", "administrative_declaration"},
     }
 """
+# ── Compatibilité Python 3.8+ pour les annotations de type ───────────────────
+from __future__ import annotations
 
+import os
 import time
-import sys
 from collections import Counter
 from pathlib import Path
-from typing import Dict, List, Optional, Any
+from typing import Any, Dict, List, Optional
 
 import numpy as np
 from loguru import logger
@@ -71,6 +77,9 @@ from loguru import logger
 # ─────────────────────────────────────────────────────────────────────────────
 
 INTENTS_DIR = Path(__file__).resolve().parent / "intents"
+
+# Modèle de fallback standalone (même modèle que le pipeline principal)
+_STANDALONE_EMBEDDING_MODEL = "BAAI/bge-m3"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Définition des tiers — SEUL endroit à modifier pour changer un tier
@@ -134,6 +143,8 @@ class IntentClassifier:
     Args:
         shared_embeddings: Instance HuggingFaceEmbeddings partagée avec RAGPipeline
                            (évite de recharger BGE-M3 en mémoire une 2e fois).
+                           Si None, charge BGE-M3 de façon autonome (usage standalone,
+                           tests, debug) — un avertissement est émis dans ce cas.
         intents_dir: Dossier racine des exemples d'intent (défaut: intents/)
         top_k: Nombre de voisins pour le vote majoritaire (défaut: 7)
         gate_confidence_threshold: Confiance min pour activer le gate (défaut: 0.45)
@@ -141,11 +152,17 @@ class IntentClassifier:
 
     def __init__(
         self,
-        shared_embeddings,
+        shared_embeddings: Optional[Any] = None,
         intents_dir: Path = INTENTS_DIR,
         top_k: int = TOP_K,
         gate_confidence_threshold: float = GATE_CONFIDENCE_THRESHOLD,
-    ):
+    ) -> None:
+        # Mémorise si les embeddings ont été fournis depuis l'extérieur.
+        # Utilisé dans get_stats() pour distinguer mode partagé / standalone —
+        # après _ensure_embeddings(), self.embeddings est toujours non-None et
+        # ne permet plus de faire la distinction.
+        self._shared_embeddings_provided: bool = shared_embeddings is not None
+
         self.embeddings = shared_embeddings
         self.intents_dir = intents_dir
         self.top_k = top_k
@@ -163,6 +180,57 @@ class IntentClassifier:
 
     # ── Chargement ────────────────────────────────────────────────────────────
 
+    def _ensure_embeddings(self) -> bool:
+        """
+        Garantit que self.embeddings est disponible.
+
+        Si shared_embeddings n'a pas été fourni au constructeur, charge BGE-M3
+        de façon autonome (mode standalone). Émet un avertissement car ce mode
+        consomme de la VRAM supplémentaire si le pipeline principal tourne en
+        parallèle.
+
+        Returns:
+            True si les embeddings sont prêts, False en cas d'échec.
+        """
+        if self.embeddings is not None:
+            return True
+
+        logger.warning(
+            "IntentClassifier: aucun shared_embeddings fourni — "
+            "chargement standalone de {} (double VRAM si RAGPipeline actif). "
+            "Passez shared_embeddings=pipeline.embeddings pour éviter ça.",
+            _STANDALONE_EMBEDDING_MODEL,
+        )
+
+        try:
+            import torch
+            from langchain_huggingface import HuggingFaceEmbeddings
+
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+            hf_token = os.getenv("HF_TOKEN", "").strip()
+            model_kwargs: Dict[str, Any] = {"device": device}
+            if hf_token:
+                model_kwargs["token"] = hf_token
+
+            self.embeddings = HuggingFaceEmbeddings(
+                model_name=_STANDALONE_EMBEDDING_MODEL,
+                model_kwargs=model_kwargs,
+                encode_kwargs={"normalize_embeddings": True},
+            )
+            logger.info(
+                "IntentClassifier: embeddings standalone chargés ({} sur {})",
+                _STANDALONE_EMBEDDING_MODEL, device,
+            )
+            return True
+
+        except Exception as exc:
+            logger.error(
+                "IntentClassifier: impossible de charger les embeddings standalone: {}. "
+                "Classifier désactivé.",
+                exc,
+            )
+            return False
+
     def _load_examples(self) -> None:
         """
         Lit tous les fichiers intents/*/suggk.txt, calcule les embeddings
@@ -173,7 +241,8 @@ class IntentClassifier:
         if not self.intents_dir.exists():
             logger.warning(
                 "IntentClassifier: dossier intents introuvable: {}. "
-                "Classifier désactivé.", self.intents_dir
+                "Classifier désactivé — vérifiez INTENTS_DIR ou la structure du projet.",
+                self.intents_dir,
             )
             return
 
@@ -184,7 +253,10 @@ class IntentClassifier:
         intent_dirs = sorted([d for d in self.intents_dir.iterdir() if d.is_dir()])
 
         if not intent_dirs:
-            logger.warning("IntentClassifier: aucun dossier d'intent trouvé dans {}", self.intents_dir)
+            logger.warning(
+                "IntentClassifier: aucun dossier d'intent trouvé dans {}",
+                self.intents_dir,
+            )
             return
 
         for intent_dir in intent_dirs:
@@ -192,7 +264,9 @@ class IntentClassifier:
             suggk_file = intent_dir / "suggk.txt"
 
             if not suggk_file.exists():
-                logger.debug("IntentClassifier: pas de suggk.txt dans {}, ignoré", intent_dir)
+                logger.debug(
+                    "IntentClassifier: pas de suggk.txt dans {}, ignoré", intent_dir
+                )
                 continue
 
             examples = [
@@ -202,29 +276,41 @@ class IntentClassifier:
             ]
 
             if not examples:
-                logger.debug("IntentClassifier: suggk.txt vide pour {}, ignoré", intent_name)
+                logger.debug(
+                    "IntentClassifier: suggk.txt vide pour {}, ignoré", intent_name
+                )
                 continue
 
             tier = INTENT_TIERS.get(intent_name)
             if tier is None:
                 logger.warning(
                     "IntentClassifier: intent '{}' non défini dans INTENT_TIERS — "
-                    "ajoutez-le avec son tier. Intent ignoré.", intent_name
+                    "ajoutez-le avec son tier. Intent ignoré.",
+                    intent_name,
                 )
                 continue
 
             texts.extend(examples)
             labels.extend([intent_name] * len(examples))
             self.intent_tier_map[intent_name] = tier
-            logger.debug("IntentClassifier: {} exemples chargés pour '{}'", len(examples), intent_name)
+            logger.debug(
+                "IntentClassifier: {} exemples chargés pour '{}'",
+                len(examples), intent_name,
+            )
 
         if not texts:
-            logger.error("IntentClassifier: aucun exemple valide chargé. Classifier désactivé.")
+            logger.error(
+                "IntentClassifier: aucun exemple valide chargé. Classifier désactivé."
+            )
+            return
+
+        # Garantir que les embeddings sont disponibles avant de les appeler
+        if not self._ensure_embeddings():
             return
 
         logger.info(
             "IntentClassifier: calcul embeddings pour {} exemples ({} intents)...",
-            len(texts), len(self.intent_tier_map)
+            len(texts), len(self.intent_tier_map),
         )
 
         try:
@@ -245,14 +331,19 @@ class IntentClassifier:
             counts = Counter(labels)
             logger.info(
                 "IntentClassifier prêt: {} exemples, {} intents, {:.0f}ms",
-                len(texts), len(self.intent_tier_map), elapsed
+                len(texts), len(self.intent_tier_map), elapsed,
             )
             for intent in sorted(counts):
                 tier = self.intent_tier_map.get(intent, "?")
-                logger.debug("  [tier {}] {}: {} exemples", tier, intent, counts[intent])
+                logger.debug(
+                    "  [tier {}] {}: {} exemples", tier, intent, counts[intent]
+                )
 
         except Exception as exc:
-            logger.error("IntentClassifier: erreur calcul embeddings: {}. Classifier désactivé.", exc)
+            logger.error(
+                "IntentClassifier: erreur calcul embeddings: {}. Classifier désactivé.",
+                exc,
+            )
 
     # ── Classification ────────────────────────────────────────────────────────
 
@@ -261,7 +352,7 @@ class IntentClassifier:
         Classifie l'intent d'une requête par vote majoritaire cosinus.
 
         Pipeline :
-          1. Embed la query (BGE-M3 partagé)
+          1. Embed la query (BGE-M3 partagé ou standalone)
           2. Cosine similarity contre tous les exemples
           3. Top-K voisins → vote majoritaire
           4. Confiance = score cosinus moyen des voisins de l'intent gagnant
@@ -300,7 +391,9 @@ class IntentClassifier:
             # 3. Top-K voisins
             k = min(self.top_k, len(similarities))
             top_k_indices = np.argpartition(similarities, -k)[-k:]
-            top_k_indices = top_k_indices[np.argsort(similarities[top_k_indices])[::-1]]
+            top_k_indices = top_k_indices[
+                np.argsort(similarities[top_k_indices])[::-1]
+            ]
 
             top_labels = [self.example_labels[i] for i in top_k_indices]
             top_scores = [float(similarities[i]) for i in top_k_indices]
@@ -318,7 +411,6 @@ class IntentClassifier:
 
             elapsed_ms = (time.perf_counter() - start) * 1000
 
-            # Log lisible
             top3_str = ", ".join(
                 f"{self.example_labels[int(i)]}({float(similarities[int(i)]):.3f})"
                 for i in top_k_indices[:3]
@@ -330,7 +422,7 @@ class IntentClassifier:
 
             logger.info(
                 "IntentClassifier: '{}' → {} [tier {}] conf={:.3f} ({:.0f}ms)",
-                query[:60], winner, tier, confidence, elapsed_ms
+                query[:60], winner, tier, confidence, elapsed_ms,
             )
 
             return {
@@ -363,14 +455,14 @@ class IntentClassifier:
         if confidence < self.gate_confidence_threshold:
             logger.debug(
                 "IntentClassifier gate vidéo: confiance {} < seuil {} → pass-through",
-                confidence, self.gate_confidence_threshold
+                confidence, self.gate_confidence_threshold,
             )
             return True  # Confiance trop faible → comportement conservateur
 
         result = intent in VIDEO_RETRIEVER_INTENTS
         logger.debug(
             "IntentClassifier gate vidéo: intent='{}' → {}",
-            intent, "ACTIF" if result else "BLOQUÉ"
+            intent, "ACTIF" if result else "BLOQUÉ",
         )
         return result
 
@@ -390,14 +482,14 @@ class IntentClassifier:
         if confidence < self.gate_confidence_threshold:
             logger.debug(
                 "IntentClassifier gate form: confiance {} < seuil {} → pass-through",
-                confidence, self.gate_confidence_threshold
+                confidence, self.gate_confidence_threshold,
             )
             return True
 
         result = intent in FORM_RETRIEVER_INTENTS
         logger.debug(
             "IntentClassifier gate form: intent='{}' → {}",
-            intent, "ACTIF" if result else "BLOQUÉ"
+            intent, "ACTIF" if result else "BLOQUÉ",
         )
         return result
 
@@ -430,11 +522,15 @@ class IntentClassifier:
             return {"loaded": False}
         counts = Counter(self.example_labels)
         return {
-            "loaded":        True,
-            "total_examples": len(self.example_labels),
-            "total_intents":  len(self.intent_tier_map),
-            "top_k":         self.top_k,
-            "gate_threshold": self.gate_confidence_threshold,
-            "intents_by_tier": self.get_intents_by_tier(),
+            "loaded":           True,
+            "total_examples":   len(self.example_labels),
+            "total_intents":    len(self.intent_tier_map),
+            "top_k":            self.top_k,
+            "gate_threshold":   self.gate_confidence_threshold,
+            # True = mode standalone (BGE-M3 chargé ici), False = embeddings partagés.
+            # Mémorisé au __init__ car après _ensure_embeddings() self.embeddings
+            # est toujours non-None et ne permet plus de distinguer les deux cas.
+            "standalone_mode":  not self._shared_embeddings_provided,
+            "intents_by_tier":  self.get_intents_by_tier(),
             "examples_per_intent": dict(counts),
         }

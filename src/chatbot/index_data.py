@@ -1,3 +1,19 @@
+"""
+src/indexing/index_data.py
+===========================
+Construit (ou met à jour) le vectorstore ChromaDB à partir des fichiers
+FAQ RCAR/CNRA stockés dans data/supportstagerag.
+
+Stratégie de mise à jour :
+    - La collection est PARTAGÉE avec les vidéos et les formulaires.
+    - Avant réindexation, SEULS les chunks type="doc" sont supprimés
+      (les chunks type="video" et type="form" sont préservés).
+    - La suppression est VÉRIFIÉE : si elle échoue ou est incomplète,
+      l'indexation est annulée pour éviter les doublons.
+"""
+# ── Compatibilité Python 3.8+ pour les annotations de type ───────────────────
+from __future__ import annotations
+
 import logging
 import os
 import shutil
@@ -26,7 +42,7 @@ EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", DEFAULT_EMBEDDING_MODEL)
 DEFAULT_PROCESSED_ROOT = PROJECT_ROOT / "data" / "supportstagerag"
 DEFAULT_VECTORSTORE_DIR = PROJECT_ROOT / "data" / "vectorstore" / "chroma_db_unified"
 
-DEFAULT_CHUNK_SIZE = 1200 # Nombre de caractères par chunk
+DEFAULT_CHUNK_SIZE    = 1200  # Nombre de caractères par chunk
 DEFAULT_CHUNK_OVERLAP = 180
 
 logging.basicConfig(
@@ -59,7 +75,6 @@ def _resolve_embedding_device():
     """Prefer CUDA when available, otherwise fallback to CPU."""
     try:
         import torch
-
         if torch.cuda.is_available():
             return "cuda"
     except Exception:
@@ -135,14 +150,11 @@ def collect_files(
 
             files = _list_supported_documents(folder)
             collected.extend(files)
-            md_count = sum(1 for file in files if file.suffix.lower() == ".md")
+            md_count  = sum(1 for file in files if file.suffix.lower() == ".md")
             txt_count = sum(1 for file in files if file.suffix.lower() == ".txt")
             logging.info(
                 "%s: %s fichiers FAQ (md=%s, txt=%s)",
-                folder,
-                len(files),
-                md_count,
-                txt_count,
+                folder, len(files), md_count, txt_count,
             )
 
     return collected
@@ -166,34 +178,34 @@ def load_documents(file_paths, processed_root=DEFAULT_PROCESSED_ROOT):
         try:
             relative = file_path.resolve().relative_to(root)
             parts = relative.parts
-            site = parts[0] if len(parts) > 0 else "unknown"
+            site        = parts[0] if len(parts) > 0 else "unknown"
             source_type = parts[1] if len(parts) > 1 else "unknown"
-            faq_scope = parts[2] if len(parts) > 2 else "unknown"
-            topic = "/".join(parts[3:-1]) if len(parts) > 4 else ""
-            language = TARGET_LANGUAGE
+            faq_scope   = parts[2] if len(parts) > 2 else "unknown"
+            topic       = "/".join(parts[3:-1]) if len(parts) > 4 else ""
+            language    = TARGET_LANGUAGE
         except Exception:
-            relative = file_path
-            site = "unknown"
+            relative    = file_path
+            site        = "unknown"
             source_type = "unknown"
-            faq_scope = "unknown"
-            topic = ""
-            language = TARGET_LANGUAGE
+            faq_scope   = "unknown"
+            topic       = ""
+            language    = TARGET_LANGUAGE
 
         documents.append(
             Document(
                 page_content=text,
                 metadata={
-                    "source": str(file_path.as_posix()),
+                    "source":          str(file_path.as_posix()),
                     "relative_source": str(relative).replace("\\", "/"),
-                    "org": site if site in ("cnra", "rcar") else "both",
-                    "type": "doc",
-                    "site": site,
-                    "source_type": source_type,
-                    "faq_scope": faq_scope,
-                    "faq_topic": topic,
-                    "language": language,
-                    "file_name": file_path.name,
-                    "file_extension": file_path.suffix.lower(),
+                    "org":             site if site in ("cnra", "rcar") else "both",
+                    "type":            "doc",
+                    "site":            site,
+                    "source_type":     source_type,
+                    "faq_scope":       faq_scope,
+                    "faq_topic":       topic,
+                    "language":        language,
+                    "file_name":       file_path.name,
+                    "file_extension":  file_path.suffix.lower(),
                 },
             )
         )
@@ -232,8 +244,8 @@ def chunk_documents(documents, chunk_size=DEFAULT_CHUNK_SIZE, chunk_overlap=DEFA
     splitter = build_chunker(chunk_size=chunk_size, chunk_overlap=chunk_overlap)
     chunks = splitter.split_documents(documents)
 
-    # Add stable chunk index per source file.
-    per_source_index = {}
+    # Ajoute un index de chunk stable par fichier source.
+    per_source_index: dict[str, int] = {}
     for chunk in chunks:
         source = chunk.metadata.get("relative_source", chunk.metadata.get("source", "unknown"))
         current_idx = per_source_index.get(source, 0)
@@ -241,6 +253,48 @@ def chunk_documents(documents, chunk_size=DEFAULT_CHUNK_SIZE, chunk_overlap=DEFA
         per_source_index[source] = current_idx + 1
 
     return chunks
+
+
+def _delete_doc_chunks(vectorstore: Chroma) -> None:
+    """
+    Supprime TOUS les chunks de type='doc' de la collection partagée,
+    puis vérifie que la suppression est complète.
+
+    La vérification en deux temps (count avant → delete → count après)
+    est essentielle car Chroma ne lève pas toujours d'exception en cas
+    d'échec partiel. Sans vérification, on risque d'accumuler des doublons
+    à chaque réindexation.
+
+    Raises:
+        RuntimeError: si la suppression est incomplète après l'appel.
+        Exception:    si une erreur inattendue survient lors du delete.
+    """
+    # Comptage des entrées existantes — include=[] pour éviter de rapatrier
+    # tout le contenu (on n'a besoin que des IDs).
+    result_before = vectorstore._collection.get(where={"type": "doc"}, include=[])
+    n_before = len(result_before.get("ids", []))
+
+    if n_before == 0:
+        logging.info(
+            "Aucun chunk type=doc dans la collection — première indexation ou collection vierge."
+        )
+        return
+
+    logging.info("Suppression de %d chunks type=doc avant réindexation...", n_before)
+    vectorstore._collection.delete(where={"type": "doc"})
+
+    # Vérification : s'assurer que plus aucun chunk doc ne subsiste
+    result_after = vectorstore._collection.get(where={"type": "doc"}, include=[])
+    n_after = len(result_after.get("ids", []))
+
+    if n_after > 0:
+        raise RuntimeError(
+            f"Suppression incomplète : {n_after}/{n_before} chunks type=doc toujours présents. "
+            f"Réindexation annulée pour éviter les doublons. "
+            f"Vérifiez l'état de la collection ChromaDB."
+        )
+
+    logging.info("Chunks type=doc supprimés avec succès : %d entrées retirées.", n_before)
 
 
 def index_data(
@@ -251,7 +305,10 @@ def index_data(
     chunk_overlap=DEFAULT_CHUNK_OVERLAP,
 ):
     """
-    Build a ChromaDB vector store from RCAR/CNRA FAQ files stored in supportstagerag.
+    Construit (ou met à jour) le vectorstore ChromaDB à partir des FAQ RCAR/CNRA.
+
+    La collection est partagée avec les vidéos et formulaires — on ne supprime
+    que les chunks type='doc' avant de réindexer.
     """
     analysis = analyze_processed_data(processed_root=processed_root)
     for bucket, stats in analysis.items():
@@ -277,18 +334,11 @@ def index_data(
     if not documents:
         raise ValueError("Aucun document exploitable trouve apres lecture des fichiers FAQ.")
 
-    chunks = chunk_documents(
-        documents,
-        chunk_size=chunk_size,
-        chunk_overlap=chunk_overlap,
-    )
+    chunks = chunk_documents(documents, chunk_size=chunk_size, chunk_overlap=chunk_overlap)
     if not chunks:
         raise ValueError("Aucun chunk genere. Verifiez les contenus FAQ md/txt.")
 
     persist_path = _resolve_project_path(persist_directory)
-
-    # Ne jamais supprimer tout le dossier unifié (partagé avec vidéos et formulaires).
-    # Supprimer uniquement les chunks de type "doc" avant réindexation.
     persist_path.mkdir(parents=True, exist_ok=True)
 
     device = _resolve_embedding_device()
@@ -300,7 +350,7 @@ def index_data(
             "(limites plus strictes)."
         )
 
-    model_kwargs = {"device": device}
+    model_kwargs: dict = {"device": device}
     if hf_token:
         model_kwargs["token"] = hf_token
 
@@ -310,18 +360,25 @@ def index_data(
         encode_kwargs={"normalize_embeddings": True},
     )
 
-    # Supprimer uniquement les chunks type="doc" avant réindexation partielle
+    # ── Suppression sécurisée des anciens chunks doc ───────────────────────────
+    # On ouvre la collection AVANT d'ajouter les nouveaux chunks pour pouvoir
+    # vérifier et supprimer les anciens. Si la suppression échoue (partielle ou
+    # totale), on lève une exception et on n'indexe rien — pas de doublons.
     vectorstore = Chroma(
         persist_directory=str(persist_path),
         embedding_function=embeddings,
         collection_name=collection_name,
     )
-    try:
-        vectorstore._collection.delete(where={"type": "doc"})
-        logging.info("Chunks type=doc supprimés de la collection unifiée avant réindexation")
-    except Exception as exc:
-        logging.warning("Impossible de supprimer les chunks doc existants: %s", exc)
 
+    try:
+        _delete_doc_chunks(vectorstore)
+    except Exception as exc:
+        logging.error(
+            "Suppression des chunks doc échouée : %s — réindexation annulée.", exc
+        )
+        raise
+
+    # ── Indexation ────────────────────────────────────────────────────────────
     vectorstore.add_documents(chunks)
 
     logging.info("ChromaDB sauvegarde dans %s", persist_path)
@@ -332,11 +389,11 @@ def index_data(
 
     return {
         "persist_directory": str(persist_path),
-        "collection_name": collection_name,
-        "documents": len(documents),
-        "chunks": len(chunks),
-        "chunk_size": chunk_size,
-        "chunk_overlap": chunk_overlap,
+        "collection_name":   collection_name,
+        "documents":         len(documents),
+        "chunks":            len(chunks),
+        "chunk_size":        chunk_size,
+        "chunk_overlap":     chunk_overlap,
     }
 
 

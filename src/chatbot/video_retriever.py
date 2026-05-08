@@ -13,6 +13,8 @@ Pipeline:
 Le VideoRetriever est optionnel : si le vectorstore n'existe pas,
 il retourne silencieusement une liste vide sans bloquer le RAG principal.
 """
+# ── Compatibilité Python 3.8+ pour les annotations de type ───────────────────
+from __future__ import annotations
 
 import os
 import sys
@@ -39,13 +41,13 @@ YOUTUBE_VECTORSTORE_DIR = BASE_DIR / "data" / "vectorstore" / "chroma_db_unified
 COLLECTION_NAME = "rcar_cnra_unified"
 EMBEDDING_MODEL = "BAAI/bge-m3"
 
-# Reranker multilingue — cohérent avec le pipeline du projet principal (shipping)
+# Reranker multilingue — cohérent avec le pipeline du projet principal
 RERANKER_MODEL = "BAAI/bge-reranker-v2-m3"
 
 # Paramètres de retrieval
-TOP_K_RETRIEVE = 10      # Candidats récupérés avant reranking
-TOP_K_FINAL = 2          # Vidéos retournées après reranking
-RELEVANCE_THRESHOLD = 0.1  # Seuil minimum de score reranker (à ajuster)
+TOP_K_RETRIEVE = 10       # Candidats récupérés avant reranking
+TOP_K_FINAL = 2           # Vidéos retournées après reranking
+RELEVANCE_THRESHOLD = 0.1 # Seuil minimum de score reranker (à ajuster)
 
 
 class VideoRetriever:
@@ -58,12 +60,12 @@ class VideoRetriever:
 
     Chaque vidéo retournée est un dict:
         {
-            "video_id": "abc123",
-            "title": "Titre de la vidéo",
-            "url": "https://www.youtube.com/watch?v=abc123",
+            "video_id":      "abc123",
+            "title":         "Titre de la vidéo",
+            "url":           "https://www.youtube.com/watch?v=abc123",
             "thumbnail_url": "https://img.youtube.com/vi/abc123/mqdefault.jpg",
-            "score": 0.82,
-            "excerpt": "Début du passage pertinent...",
+            "score":         0.82,
+            "excerpt":       "Début du passage pertinent...",
         }
     """
 
@@ -85,7 +87,7 @@ class VideoRetriever:
         self._available = False
         self.vectorstore = None
         self.reranker = None
-        self.embeddings = shared_embeddings  # ✅ Instance partagée
+        self.embeddings = shared_embeddings  # Instance partagée
 
         if setup_logger is not None and not is_logger_initialized():
             setup_logger(log_dir=LOGS_DIR, source="youtube_fetch")
@@ -105,7 +107,7 @@ class VideoRetriever:
             logger.warning("VideoRetriever: impossible de charger le vectorstore: {}", exc)
             return
 
-        # ✅ Accepte le reranker partagé, ou le charge seul si absent
+        # Accepte le reranker partagé, ou le charge seul si absent
         if shared_reranker is not None:
             self.reranker = shared_reranker
         else:
@@ -113,7 +115,9 @@ class VideoRetriever:
                 self._load_reranker(reranker_model)
             except Exception as exc:
                 logger.warning(
-                    "VideoRetriever: reranker indisponible ({}). Utilisation scores vectoriels uniquement.", exc
+                    "VideoRetriever: reranker indisponible ({}). "
+                    "Utilisation scores vectoriels uniquement.",
+                    exc,
                 )
 
         self._available = True
@@ -127,11 +131,16 @@ class VideoRetriever:
 
     # ─── Chargement ───────────────────────────────────────────────────────────
 
-    def _load_vectorstore(self, directory: Path, collection_name: str, embedding_model: str) -> None:
+    def _load_vectorstore(
+        self,
+        directory: Path,
+        collection_name: str,
+        embedding_model: str,
+    ) -> None:
         from langchain_chroma import Chroma
         from langchain_huggingface import HuggingFaceEmbeddings
 
-        # ✅ Utilise les embeddings partagés si disponibles (pas de re-chargement)
+        # Utilise les embeddings partagés si disponibles (évite le rechargement VRAM)
         if self.embeddings is not None:
             logger.info("VideoRetriever: utilise embeddings partagés (optimisation VRAM)")
             self.vectorstore = Chroma(
@@ -207,7 +216,7 @@ class VideoRetriever:
             for i, doc in enumerate(docs):
                 title = doc.metadata.get("title", "Unknown")
                 vid_id = doc.metadata.get("video_id", "")
-                logger.debug("  [{}] Vidéo: '{}' (ID: {})", i+1, title, vid_id)
+                logger.debug("  [{}] Vidéo: '{}' (ID: {})", i + 1, title, vid_id)
         except Exception as exc:
             logger.error("Erreur recherche YouTube: {}", exc)
             return []
@@ -222,7 +231,10 @@ class VideoRetriever:
                 scores = self.reranker.predict(pairs).tolist()
                 logger.debug("--- SCORES APRÈS RERANKING ---")
                 for i, (doc, score) in enumerate(zip(docs, scores)):
-                     logger.debug("  [{}] Score: {:.4f} | Vidéo: '{}'", i+1, score, doc.metadata.get("title", ""))
+                    logger.debug(
+                        "  [{}] Score: {:.4f} | Vidéo: '{}'",
+                        i + 1, score, doc.metadata.get("title", ""),
+                    )
             except Exception as exc:
                 logger.warning("Reranker erreur: {} — fallback scores vectoriels", exc)
                 scores = [0.5] * len(docs)
@@ -246,15 +258,15 @@ class VideoRetriever:
                     excerpt += "..."
 
                 best_per_video[vid_id] = {
-                    "video_id": vid_id,
-                    "title": doc.metadata.get("title", "Vidéo CNRA/RCAR"),
-                    "url": doc.metadata.get("url", ""),
+                    "video_id":      vid_id,
+                    "title":         doc.metadata.get("title", "Vidéo CNRA/RCAR"),
+                    "url":           doc.metadata.get("url", ""),
                     "thumbnail_url": doc.metadata.get(
                         "thumbnail_url",
                         f"https://img.youtube.com/vi/{vid_id}/mqdefault.jpg",
                     ),
-                    "score": float(score),
-                    "excerpt": excerpt,
+                    "score":       float(score),
+                    "excerpt":     excerpt,
                     "upload_date": doc.metadata.get("upload_date", ""),
                 }
 
@@ -270,7 +282,7 @@ class VideoRetriever:
         if results:
             logger.info(
                 "Vidéos pertinentes: {} (meilleur score: {:.3f})",
-                len(results), results[0]["score"]
+                len(results), results[0]["score"],
             )
         else:
             logger.debug("Aucune vidéo au-dessus du seuil {}", self.relevance_threshold)
