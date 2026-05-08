@@ -10,6 +10,12 @@ RAW_DIR  = DATA_DIR / "raw"
 LOGS_DIR = BASE_DIR / "logs"
 
 # ─────────────────────────────────────────────
+# VECTORSTORE UNIFIÉ
+# ─────────────────────────────────────────────
+VECTORSTORE_DIR     = DATA_DIR / "vectorstore" / "chroma_db_unified"
+UNIFIED_COLLECTION  = "rcar_cnra_unified"
+
+# ─────────────────────────────────────────────
 # SOURCES À CRAWLER
 # ─────────────────────────────────────────────
 # Pour ajouter une nouvelle source plus tard, ajoute simplement une entrée ici.

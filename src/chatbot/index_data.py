@@ -24,7 +24,7 @@ SUPPORTED_EXTENSIONS = (".md", ".txt")
 DEFAULT_EMBEDDING_MODEL = "BAAI/bge-m3"
 EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", DEFAULT_EMBEDDING_MODEL)
 DEFAULT_PROCESSED_ROOT = PROJECT_ROOT / "data" / "supportstagerag"
-DEFAULT_VECTORSTORE_DIR = PROJECT_ROOT / "data" / "vectorstore" / "chroma_db"
+DEFAULT_VECTORSTORE_DIR = PROJECT_ROOT / "data" / "vectorstore" / "chroma_db_unified"
 
 DEFAULT_CHUNK_SIZE = 1200 # Nombre de caractères par chunk
 DEFAULT_CHUNK_OVERLAP = 180
@@ -185,6 +185,8 @@ def load_documents(file_paths, processed_root=DEFAULT_PROCESSED_ROOT):
                 metadata={
                     "source": str(file_path.as_posix()),
                     "relative_source": str(relative).replace("\\", "/"),
+                    "org": site if site in ("cnra", "rcar") else "both",
+                    "type": "doc",
                     "site": site,
                     "source_type": source_type,
                     "faq_scope": faq_scope,
@@ -244,10 +246,9 @@ def chunk_documents(documents, chunk_size=DEFAULT_CHUNK_SIZE, chunk_overlap=DEFA
 def index_data(
     processed_root=DEFAULT_PROCESSED_ROOT,
     persist_directory=DEFAULT_VECTORSTORE_DIR,
-    collection_name="rcar_cnra_fr",
+    collection_name="rcar_cnra_unified",
     chunk_size=DEFAULT_CHUNK_SIZE,
     chunk_overlap=DEFAULT_CHUNK_OVERLAP,
-    reset_collection=True,
 ):
     """
     Build a ChromaDB vector store from RCAR/CNRA FAQ files stored in supportstagerag.
@@ -285,9 +286,9 @@ def index_data(
         raise ValueError("Aucun chunk genere. Verifiez les contenus FAQ md/txt.")
 
     persist_path = _resolve_project_path(persist_directory)
-    if reset_collection and persist_path.exists():
-        shutil.rmtree(persist_path)
 
+    # Ne jamais supprimer tout le dossier unifié (partagé avec vidéos et formulaires).
+    # Supprimer uniquement les chunks de type "doc" avant réindexation.
     persist_path.mkdir(parents=True, exist_ok=True)
 
     device = _resolve_embedding_device()
@@ -308,15 +309,20 @@ def index_data(
         model_kwargs=model_kwargs,
         encode_kwargs={"normalize_embeddings": True},
     )
-    vectorstore = Chroma.from_documents(
-        documents=chunks,
-        embedding=embeddings,
+
+    # Supprimer uniquement les chunks type="doc" avant réindexation partielle
+    vectorstore = Chroma(
         persist_directory=str(persist_path),
+        embedding_function=embeddings,
         collection_name=collection_name,
     )
+    try:
+        vectorstore._collection.delete(where={"type": "doc"})
+        logging.info("Chunks type=doc supprimés de la collection unifiée avant réindexation")
+    except Exception as exc:
+        logging.warning("Impossible de supprimer les chunks doc existants: %s", exc)
 
-    if hasattr(vectorstore, "persist"):
-        vectorstore.persist()
+    vectorstore.add_documents(chunks)
 
     logging.info("ChromaDB sauvegarde dans %s", persist_path)
     logging.info("Collection: %s", collection_name)

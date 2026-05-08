@@ -44,8 +44,8 @@ except ImportError:
     is_logger_initialized = lambda: False
     setup_logger = None
 
-FORMS_VECTORSTORE_DIR = BASE_DIR / "data" / "vectorstore" / "chroma_db_forms"
-COLLECTION_NAME       = "forms"
+FORMS_VECTORSTORE_DIR = BASE_DIR / "data" / "vectorstore" / "chroma_db_unified"
+COLLECTION_NAME       = "rcar_cnra_unified"
 EMBEDDING_MODEL       = "BAAI/bge-m3"
 RERANKER_MODEL        = "BAAI/bge-reranker-v2-m3"
 
@@ -184,9 +184,13 @@ class FormRetriever:
         if not query:
             return []
 
-        # 1. Recherche vectorielle
+        # 1. Recherche vectorielle — filtrée sur type=form uniquement
         try:
-            docs = self.vectorstore.similarity_search(query, k=self.top_k_retrieve)
+            docs = self.vectorstore.similarity_search(
+                query,
+                k=self.top_k_retrieve,
+                filter={"type": "form"},
+            )
             logger.debug("--- CHUNKS RECUPÉRÉS AVANT RERANKING ---")
             for i, doc in enumerate(docs):
                 title = doc.metadata.get("title", "Unknown")

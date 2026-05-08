@@ -20,7 +20,6 @@ Usage :
 
 import argparse
 import json
-import shutil
 import sys
 from pathlib import Path
 
@@ -45,8 +44,8 @@ import os
 FORMS_DIR       = BASE_DIR / "data" / "forms"
 CATALOG_FILE    = FORMS_DIR / "forms.json"
 TEXTS_DIR       = FORMS_DIR / "texts"
-VECTORSTORE_DIR = BASE_DIR / "data" / "vectorstore" / "chroma_db_forms"
-COLLECTION_NAME = "forms"
+VECTORSTORE_DIR = BASE_DIR / "data" / "vectorstore" / "chroma_db_unified"
+COLLECTION_NAME = "rcar_cnra_unified"
 EMBEDDING_MODEL = "BAAI/bge-m3"
 
 MAX_TEXT_CHARS = 2000   # Tronquer les textes trop longs (formulaires exceptionnellement longs)
@@ -104,6 +103,7 @@ def build_documents(forms: list[dict]) -> list:
             page_content=content,
             metadata={
                 "source":        "forms",
+                "type":          "form",
                 "form_id":       form_id,
                 "org":           org,
                 "category":      category,
@@ -131,7 +131,6 @@ def index_forms(
     vectorstore_dir: Path = VECTORSTORE_DIR,
     collection_name: str  = COLLECTION_NAME,
     embedding_model: str  = EMBEDDING_MODEL,
-    reset:           bool = True,
 ) -> dict:
     """
     Pipeline complet : catalog → documents → ChromaDB.
@@ -152,11 +151,6 @@ def index_forms(
     documents = build_documents(forms)
     if not documents:
         raise ValueError("Aucun document valide. Vérifie que scrape_forms.py et extract_text.py ont tourné.")
-
-    # Reset
-    if reset and vectorstore_dir.exists():
-        shutil.rmtree(vectorstore_dir)
-        logger.info("Collection précédente supprimée")
 
     vectorstore_dir.mkdir(parents=True, exist_ok=True)
 
@@ -179,17 +173,20 @@ def index_forms(
         encode_kwargs={"normalize_embeddings": True},
     )
 
-    logger.info("Indexation de {} formulaires...", len(documents))
-
-    vectorstore = Chroma.from_documents(
-        documents=documents,
-        embedding=embeddings,
+    # Supprimer uniquement les chunks type="form" dans la collection unifiée
+    vectorstore = Chroma(
         persist_directory=str(vectorstore_dir),
+        embedding_function=embeddings,
         collection_name=collection_name,
     )
+    try:
+        vectorstore._collection.delete(where={"type": "form"})
+        logger.info("Chunks type=form supprimés de la collection unifiée avant réindexation")
+    except Exception as exc:
+        logger.warning("Impossible de supprimer les chunks form existants: {}", exc)
 
-    if hasattr(vectorstore, "persist"):
-        vectorstore.persist()
+    logger.info("Indexation de {} formulaires...", len(documents))
+    vectorstore.add_documents(documents)
 
     summary = {
         "vectorstore_dir":  str(vectorstore_dir),
@@ -224,7 +221,6 @@ if __name__ == "__main__":
     result = index_forms(
         collection_name=args.collection_name,
         embedding_model=args.embedding_model,
-        reset=not args.no_reset,
     )
     print("\nIndexation terminée:")
     for k, v in result.items():

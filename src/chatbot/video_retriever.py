@@ -35,8 +35,8 @@ except ImportError:
     is_logger_initialized = lambda: False
     setup_logger = None
 
-YOUTUBE_VECTORSTORE_DIR = BASE_DIR / "data" / "vectorstore" / "chroma_db_youtube"
-COLLECTION_NAME = "youtube_videos"
+YOUTUBE_VECTORSTORE_DIR = BASE_DIR / "data" / "vectorstore" / "chroma_db_unified"
+COLLECTION_NAME = "rcar_cnra_unified"
 EMBEDDING_MODEL = "BAAI/bge-m3"
 
 # Reranker multilingue — cohérent avec le pipeline du projet principal (shipping)
@@ -196,9 +196,13 @@ class VideoRetriever:
         if not query:
             return []
 
-        # 1. Recherche vectorielle
+        # 1. Recherche vectorielle — filtrée sur type=video uniquement
         try:
-            docs = self.vectorstore.similarity_search(query, k=self.top_k_retrieve)
+            docs = self.vectorstore.similarity_search(
+                query,
+                k=self.top_k_retrieve,
+                filter={"type": "video"},
+            )
             logger.debug("--- CHUNKS RECUPÉRÉS AVANT RERANKING ---")
             for i, doc in enumerate(docs):
                 title = doc.metadata.get("title", "Unknown")

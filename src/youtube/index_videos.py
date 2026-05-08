@@ -17,7 +17,6 @@ Prérequis:
 import argparse
 import json
 import os
-import shutil
 import sys
 from pathlib import Path
 
@@ -43,8 +42,8 @@ except ImportError:
     load_dotenv(BASE_DIR / ".env")
 
 TRANSCRIPTS_FILE = BASE_DIR / "data" / "youtube" / "transcripts.json"
-VECTORSTORE_DIR = BASE_DIR / "data" / "vectorstore" / "chroma_db_youtube"
-COLLECTION_NAME = "youtube_videos"
+VECTORSTORE_DIR = BASE_DIR / "data" / "vectorstore" / "chroma_db_unified"
+COLLECTION_NAME = "rcar_cnra_unified"
 EMBEDDING_MODEL = "BAAI/bge-m3"
 
 MIN_TRANSCRIPT_CHARS = 80  # Ignorer les transcripts trop courts (erreurs de sous-titres)
@@ -95,10 +94,21 @@ def build_documents(videos: list[dict], min_chars: int = MIN_TRANSCRIPT_CHARS) -
         # Le titre est répété au début pour améliorer la pertinence sémantique
         content = f"Titre : {title}\n\n{transcript}"
 
+        # Détecter l'organisme depuis le titre/description
+        text_lower = (title + " " + video.get("description", "")).lower()
+        if "cnra" in text_lower and "rcar" not in text_lower:
+            org = "cnra"
+        elif "rcar" in text_lower and "cnra" not in text_lower:
+            org = "rcar"
+        else:
+            org = "both"
+
         docs.append(Document(
             page_content=content,
             metadata={
                 "source": "youtube",
+                "type": "video",
+                "org": org,
                 "video_id": video["video_id"],
                 "title": title,
                 "url": video["url"],
@@ -171,10 +181,6 @@ def index_videos(
         raise ValueError("Aucun chunk généré.")
 
     # Reset si demandé
-    if reset and vectorstore_dir.exists():
-        shutil.rmtree(vectorstore_dir)
-        logger.info("Collection précédente supprimée: {}", vectorstore_dir)
-
     vectorstore_dir.mkdir(parents=True, exist_ok=True)
 
     # Embedding device
@@ -197,31 +203,26 @@ def index_videos(
         encode_kwargs={"normalize_embeddings": True},
     )
 
+    # Supprimer uniquement les chunks type="video" dans la collection unifiée
+    vectorstore = Chroma(
+        persist_directory=str(vectorstore_dir),
+        embedding_function=embeddings,
+        collection_name=collection_name,
+    )
+    try:
+        vectorstore._collection.delete(where={"type": "video"})
+        logger.info("Chunks type=video supprimés de la collection unifiée avant réindexation")
+    except Exception as exc:
+        logger.warning("Impossible de supprimer les chunks video existants: {}", exc)
+
     logger.info("Indexation de {} chunks en cours...", len(chunks))
 
     # Insertion par batch pour les grandes collections
     BATCH_SIZE = 100
-    if len(chunks) <= BATCH_SIZE:
-        vectorstore = Chroma.from_documents(
-            documents=chunks,
-            embedding=embeddings,
-            persist_directory=str(vectorstore_dir),
-            collection_name=collection_name,
-        )
-    else:
-        # Créer la collection vide puis insérer par batch
-        vectorstore = Chroma(
-            persist_directory=str(vectorstore_dir),
-            embedding_function=embeddings,
-            collection_name=collection_name,
-        )
-        for i in range(0, len(chunks), BATCH_SIZE):
-            batch = chunks[i: i + BATCH_SIZE]
-            vectorstore.add_documents(batch)
-            logger.info("Batch {}/{} indexé", min(i + BATCH_SIZE, len(chunks)), len(chunks))
-
-    if hasattr(vectorstore, "persist"):
-        vectorstore.persist()
+    for i in range(0, len(chunks), BATCH_SIZE):
+        batch = chunks[i: i + BATCH_SIZE]
+        vectorstore.add_documents(batch)
+        logger.info("Batch {}/{} indexé", min(i + BATCH_SIZE, len(chunks)), len(chunks))
 
     summary = {
         "vectorstore_dir": str(vectorstore_dir),

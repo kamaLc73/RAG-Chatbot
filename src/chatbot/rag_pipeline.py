@@ -63,6 +63,13 @@ from config.logger import setup_logger
 from config.settings import BASE_DIR, LOGS_DIR
 
 try:
+    from chatbot.intent_classifier import IntentClassifier
+    _INTENT_CLASSIFIER_AVAILABLE = True
+except ImportError:
+    _INTENT_CLASSIFIER_AVAILABLE = False
+    logger.warning("IntentClassifier non disponible.")
+
+try:
     from chatbot.video_retriever import VideoRetriever
     _VIDEO_RETRIEVER_AVAILABLE = True
 except ImportError:
@@ -78,7 +85,7 @@ except ImportError:
 
 load_dotenv(BASE_DIR / ".env")
 
-VECTORSTORE_RELATIVE_PATH = Path("data") / "vectorstore" / "chroma_db"
+VECTORSTORE_RELATIVE_PATH = Path("data") / "vectorstore" / "chroma_db_unified"
 DEFAULT_EMBEDDING_MODEL   = "BAAI/bge-m3"
 RERANKER_MODEL            = "BAAI/bge-reranker-v2-m3"
 HF_TOKEN = getenv("HF_TOKEN", "").strip().strip('"\'')
@@ -107,7 +114,7 @@ class RAGPipeline:
         self,
         local_model: str = OLLAMA_MODEL,
         vectorstore_path: Path | str = VECTORSTORE_RELATIVE_PATH,
-        collection_name: str = "rcar_cnra_fr",
+        collection_name: str = "rcar_cnra_unified",
         embedding_model: str = DEFAULT_EMBEDDING_MODEL,
         enable_video_suggestions: bool = True,
         enable_form_suggestions:  bool = True,
@@ -154,7 +161,20 @@ class RAGPipeline:
 
         self._warm_up_embeddings()
 
-        # ── Reranker (instance unique partagée) ───────────────────────────────
+        # ── Intent Classifier (instance partagée, réutilise les embeddings) ──
+        self.intent_classifier: IntentClassifier | None = None
+        if _INTENT_CLASSIFIER_AVAILABLE:
+            try:
+                self.intent_classifier = IntentClassifier(
+                    shared_embeddings=self.embeddings,
+                )
+                stats = self.intent_classifier.get_stats()
+                logger.info(
+                    "IntentClassifier prêt: {} intents, {} exemples",
+                    stats.get("total_intents", 0), stats.get("total_examples", 0)
+                )
+            except Exception as exc:
+                logger.warning("IntentClassifier init échoué: {} — gate désactivé", exc)
         self.shared_reranker: CrossEncoder | None = None
         try:
             self.shared_reranker = CrossEncoder(
@@ -262,11 +282,15 @@ class RAGPipeline:
     - Ne donnez jamais de conseils juridiques, fiscaux ou financiers personnalises.
     - Soyez precis sur les organismes : distinguez toujours ce qui concerne le RCAR de ce qui concerne la CNRA.
 
+    RESSOURCES SUPPLEMENTAIRES DISPONIBLES:
+    {supplementary_hint}
+
     FORMAT DE REPONSE:
     - Texte brut uniquement, sans aucune syntaxe Markdown.
     - Reponses structurees en phrases courtes et claires.
     - Pour les listes, commencez chaque element par "- " sur une nouvelle ligne.
     - Longueur adaptee a la question.
+    - Si des videos ou formulaires sont disponibles (indiques dans RESSOURCES SUPPLEMENTAIRES), mentionnez-les brievement a la fin de votre reponse. Ne dites JAMAIS que vous n'avez pas de video ou formulaire si des ressources sont disponibles.
 
     CONTEXTE DOCUMENTAIRE:
     {context}"""
@@ -278,6 +302,23 @@ class RAGPipeline:
             logger.info("Warmup embeddings: {:.3f}s", time.perf_counter() - t)
         except Exception as exc:
             logger.warning("Warmup ignoré: {}", exc)
+
+    def _build_supplementary_hint(self, videos: list, forms: list) -> str:
+        """
+        Construit un hint textuel informant le LLM des ressources disponibles
+        (vidéos et formulaires trouvés). Évite que le LLM dise "je n'ai pas de
+        vidéo/formulaire" alors qu'ils sont affichés dans l'interface.
+        """
+        parts = []
+        if videos:
+            titles = ", ".join(f'"{v.get("title", "vidéo")}"' for v in videos[:2])
+            parts.append(f"Des videos YouTube pertinentes sont disponibles pour cette question ({titles}). Elles seront affichees a l'utilisateur.")
+        if forms:
+            titles = ", ".join(f'"{f.get("title", "formulaire")}"' for f in forms[:2])
+            parts.append(f"Des formulaires PDF sont disponibles ({titles}). Ils seront affiches a l'utilisateur avec un lien de telechargement.")
+        if not parts:
+            return "Aucune video ni formulaire n'a ete trouve pour cette question."
+        return " ".join(parts)
 
     def _build_context(self, docs: list) -> str:
         parts, total = [], 0
@@ -313,8 +354,12 @@ class RAGPipeline:
         Si le reranker est indisponible, retourne les RAG_FINAL_K premiers
         résultats vectoriels (comportement identique à avant).
         """
-        # Étape 1 — pool vectoriel élargi
-        candidates = self.vectorstore.similarity_search(query, k=self.retrieval_k)
+        # Étape 1 — pool vectoriel élargi, filtré sur type=doc uniquement
+        candidates = self.vectorstore.similarity_search(
+            query,
+            k=self.retrieval_k,
+            filter={"type": "doc"},
+        )
 
         if not candidates:
             return []
@@ -410,28 +455,61 @@ class RAGPipeline:
         if not docs:
             return {"response": "Aucun passage pertinent trouvé.", "context_docs": 0, "videos": [], "forms": []}
 
-        # ── Vidéos + formulaires en parallèle ─────────────────────────────────
+        # ── Intent classification + gate retrievers ───────────────────────────
         videos, forms = [], []
+        classification = {"intent": "retrieval", "confidence": 0.0, "loaded": False}
+
+        if self.intent_classifier and self.intent_classifier.is_loaded:
+            try:
+                classification = self.intent_classifier.classify(cleaned)
+                logger.info(
+                    "Intent: {} [tier {}] conf={:.3f}",
+                    classification["intent"], classification["tier"], classification["confidence"]
+                )
+            except Exception as exc:
+                logger.warning("Intent classification échouée: {} — gate pass-through", exc)
+
+        run_videos = (
+            self.intent_classifier is None or
+            not self.intent_classifier.is_loaded or
+            self.intent_classifier.should_retrieve_videos(classification)
+        )
+        run_forms = (
+            self.intent_classifier is None or
+            not self.intent_classifier.is_loaded or
+            self.intent_classifier.should_retrieve_forms(classification)
+        )
+
         t_par = time.perf_counter()
         try:
             with ThreadPoolExecutor(max_workers=2) as pool:
-                fut_v = pool.submit(self._retrieve_videos, cleaned)
-                fut_f = pool.submit(self._retrieve_forms, cleaned)
-                videos = fut_v.result(timeout=30)
-                forms  = fut_f.result(timeout=30)
+                fut_v = pool.submit(self._retrieve_videos, cleaned) if run_videos else None
+                fut_f = pool.submit(self._retrieve_forms, cleaned) if run_forms else None
+                videos = fut_v.result(timeout=30) if fut_v else []
+                forms  = fut_f.result(timeout=30) if fut_f else []
             logger.info(
-                "Parallel retrieval: vidéos={} formulaires={} en {:.3f}s",
-                len(videos), len(forms), time.perf_counter() - t_par,
+                "Retrieval: vidéos={} (gate={}) formulaires={} (gate={}) en {:.3f}s",
+                len(videos), "ON" if run_videos else "OFF",
+                len(forms),  "ON" if run_forms  else "OFF",
+                time.perf_counter() - t_par,
             )
         except Exception as exc:
             logger.warning("Parallel retrieval échoué (fallback séquentiel): {}", exc)
-            videos = self._retrieve_videos(cleaned)
-            forms  = self._retrieve_forms(cleaned)
+            if run_videos:
+                videos = self._retrieve_videos(cleaned)
+            if run_forms:
+                forms = self._retrieve_forms(cleaned)
 
         # ── Génération LLM ────────────────────────────────────────────────────
         t1 = time.perf_counter()
         try:
-            response = str(self.chain.invoke({"context": context, "question": cleaned})).strip()
+            # Inform the LLM about any supplementary resources (videos / forms)
+            supplementary_hint = self._build_supplementary_hint(videos, forms)
+            response = str(self.chain.invoke({
+                "context": context,
+                "question": cleaned,
+                "supplementary_hint": supplementary_hint,
+            })).strip()
             logger.info("Generation: {:.3f}s | {} chars", time.perf_counter() - t1, len(response))
         except Exception as exc:
             logger.error("Erreur génération: {}", exc)
@@ -445,6 +523,8 @@ class RAGPipeline:
             "context_docs": len(docs),
             "videos":       videos,
             "forms":        forms,
+            "intent":       classification.get("intent", "retrieval"),
+            "intent_confidence": classification.get("confidence", 0.0),
         }
         self._cache_set(cleaned.lower(), payload)
         return {**payload, "original_query": query, "cached": False}
