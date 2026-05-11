@@ -118,13 +118,118 @@ theme_css = f"""
     .stForm {{ background-color: transparent; border: none; border-radius: 8px; }}
     .stFormSubmitButton > button {{
         background-color: {"#1f7a5c" if dark else "#0f5132"};
-        color: white; border: none; border-radius: 8px; padding: 8px 16px; font-weight: 500;
+        color: white; border: 1px solid transparent; border-radius: 16px;
+        padding: 10px 18px; font-weight: 600; box-shadow: 0 4px 20px rgba(0,0,0,0.25);
+        transition: all 0.2s ease-in-out;
+        white-space: nowrap;
+        min-width: 110px;
+    }}
+    .stFormSubmitButton > button:hover {{
+        filter: brightness(1.08);
+        transform: translateY(-1px);
     }}
     .stButton > button {{
         background-color: {"#325248" if dark else "#5f7a70"};
-        color: white; border: none; border-radius: 8px; padding: 8px 16px;
+        color: white; border: 1px solid {"#35564d" if dark else "#b7d0c4"};
+        border-radius: 16px; padding: 10px 16px; box-shadow: 0 4px 20px rgba(0,0,0,0.25);
+        transition: all 0.2s ease-in-out;
+    }}
+    .stButton > button:hover {{
+        filter: brightness(1.08);
+        transform: translateY(-1px);
+    }}
+    button[kind="primary"] {{
+        background-color: {"#1f7a5c" if dark else "#0f5132"};
+        border: 1px solid transparent;
     }}
     .stMarkdown p {{ color: {"#ffffff" if dark else "#000000"}; }}
+
+    div[data-testid="stAudioInput"] {{
+        max-width: 220px;
+        width: 100%;
+        margin-left: auto;
+        margin-right: 0;
+        min-height: 42px;
+        height: 42px;
+        display: flex;
+        align-items: center;
+        justify-content: flex-end;
+        background-color: transparent;
+        border: none;
+        box-shadow: none;
+        padding: 0;
+    }}
+    div[data-testid="stAudioInput"] > div {{
+        height: 42px;
+        min-height: 42px;
+        display: flex;
+        align-items: center;
+    }}
+    div[data-testid="stAudioInput"] button {{
+        min-height: 42px;
+        height: 42px;
+        padding: 0 12px;
+    }}
+    div[data-testid="stAudioInput"] * {{
+        color: inherit;
+    }}
+
+    div[data-testid="stAudioInput"] {{
+        position: relative;
+        z-index: 20;
+    }}
+
+    /* popup menu */
+    div[data-testid="stAudioInput"] [role="menu"] {{
+        background: #1A2433 !important;
+        border: 1px solid #2E4057 !important;
+        border-radius: 14px !important;
+        padding: 6px !important;
+        box-shadow: 0 8px 30px rgba(0,0,0,0.45) !important;
+        min-width: 180px !important;
+    }}
+
+    /* menu buttons */
+    div[data-testid="stAudioInput"] [role="menu"] button {{
+        background: transparent !important;
+        color: #F4F7FB !important;
+        border-radius: 10px !important;
+        transition: all 0.15s ease-in-out !important;
+        font-weight: 500 !important;
+    }}
+
+    /* hover */
+    div[data-testid="stAudioInput"] [role="menu"] button:hover {{
+        background: #24364D !important;
+        color: #38BDF8 !important;
+    }}
+
+    /* timer text */
+    div[data-testid="stAudioInput"] span {{
+        color: #DCE7F3 !important;
+    }}
+
+    /* dots/options button */
+    div[data-testid="stAudioInput"] button[kind="secondary"] {{
+        background: #132235 !important;
+        border: 1px solid #28435E !important;
+        color: #F4F7FB !important;
+    }}
+
+    /* mic/play buttons */
+    div[data-testid="stAudioInput"] button {{
+        color: #F4F7FB !important;
+    }}
+
+    /* fix clipping */
+    div[data-testid="stAudioInput"] > div {{
+        overflow: visible !important;
+    }}
+
+    /* ensure popover visible */
+    [data-baseweb="popover"] {{
+        z-index: 99999 !important;
+    }}
     .stSpinner {{ display: none !important; }}
     .custom-spinner {{ display:flex;flex-direction:column;justify-content:center;align-items:center;margin:20px 0; }}
     .custom-spinner .spinner-ring {{
@@ -249,7 +354,6 @@ with st.sidebar:
         ):
             if st.session_state["selected_org"] != org_key:
                 st.session_state["selected_org"] = org_key
-                # Réinitialiser la conversation au changement d'org
                 st.session_state["history"] = [{
                     "type": "bot",
                     "content": get_welcome_message(org_key),
@@ -257,7 +361,7 @@ with st.sidebar:
                     "forms": [],
                 }]
                 st.rerun()
-    
+
     st.markdown("---")
     st.markdown("### Paramètres")
     if st.button("Mode sombre" if dark else "Mode clair", key="theme_toggle"):
@@ -361,17 +465,9 @@ def render_video_cards(videos: list[dict]) -> str:
 
 
 def render_form_cards(forms: list[dict]) -> str:
-    """Génère les cartes HTML pour les formulaires PDF.
-
-    IMPORTANT : tout le HTML est généré sans indentation ni sauts de ligne
-    significatifs, car Streamlit interprète les lignes débutant par 4+ espaces
-    comme des blocs de code Markdown — ce qui afficherait le HTML brut au lieu
-    de le rendre (même avec unsafe_allow_html=True).
-    """
     if not forms:
         return ""
 
-    # Label d'en-tête — compact, pas d'indentation
     cards = '<div class="form-suggestions"><div class="form-suggestions-label">📄 Formulaires disponibles</div>'
 
     for f in forms:
@@ -381,14 +477,12 @@ def render_form_cards(forms: list[dict]) -> str:
         pdf_url   = html.escape(f.get("pdf_url",  "#"))
         org_class = "form-org-cnra" if org == "CNRA" else "form-org-rcar"
 
-        # Bouton téléchargement — une seule ligne, zéro indentation
         actions = (
             f'<div class="form-card-actions">'
             f'<a href="{pdf_url}" target="_blank" rel="noopener noreferrer" class="form-action-btn form-action-download">'
             f'⬇ Télécharger PDF</a></div>'
         ) if pdf_url != "#" else ""
 
-        # Carte entière sur une seule ligne logique (pas de newline + 4 espaces)
         cards += (
             f'<div class="form-card">'
             f'<div class="form-card-icon-box">📄</div>'
@@ -461,7 +555,7 @@ with st.container():
                 if html_v:
                     st.markdown(html_v, unsafe_allow_html=True)
 
-            # Cartes formulaire (dessous vidéos)
+            # Cartes formulaire
             if message.get("forms") and message["content"] and not (is_last and st.session_state["processing"]):
                 html_f = render_form_cards(message["forms"])
                 if html_f:
@@ -484,10 +578,12 @@ if st.session_state["processing"]:
             unsafe_allow_html=True,
         )
 
-# ── Zone de saisie (texte + micro) ───────────────────────────────────────────
+# ── Zone de saisie ────────────────────────────────────────────────────────────
 st.markdown('<div class="form-container">', unsafe_allow_html=True)
 
-# Micro — au-dessus du champ texte, label caché mais non vide (accessibilité)
+# ⚠️  CORRECTION : audio_input EN DEHORS des colonnes et AVANT le formulaire
+# — exactement comme l'ancienne version qui fonctionnait.
+# Le placer dans une colonne ou après un st.form corrompt son blob URL au rerun.
 audio_value = st.audio_input("Message vocal", key="mic_input", label_visibility="collapsed")
 
 # Formulaire texte
@@ -503,9 +599,10 @@ with st.form(key="chat_form", clear_on_submit=True):
             "Envoyer",
             disabled=st.session_state["processing"],
         )
+
 st.markdown("</div>", unsafe_allow_html=True)
 
-# Traitement audio — détection d'un nouvel enregistrement
+# ── Traitement audio ──────────────────────────────────────────────────────────
 if audio_value is not None:
     audio_id = hash(audio_value.read())
     audio_value.seek(0)
@@ -524,8 +621,7 @@ if audio_value is not None:
         else:
             st.warning("Aucun texte détecté — réessayez.")
 
-
-# ── Soumission ────────────────────────────────────────────────────────────────
+# ── Soumission texte ──────────────────────────────────────────────────────────
 if submit and user_input and not st.session_state["processing"]:
     st.session_state["processing"] = True
     st.session_state["show_typewriter"] = False
@@ -534,7 +630,6 @@ if submit and user_input and not st.session_state["processing"]:
         {"type": "bot",  "content": "",           "videos": [], "forms": []},
     ])
     st.rerun()
-
 
 # ── Génération ────────────────────────────────────────────────────────────────
 if (
