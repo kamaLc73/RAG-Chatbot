@@ -5,12 +5,12 @@ Classification d'intent par similarité cosinus sur embeddings BGE-M3.
 
 Inspiré du IntentSimilarityClassifier du projet shipping, adapté pour
 fonctionner sans base de données ni LLM supplémentaire :
-  - Les exemples sont chargés depuis des fichiers texte (intents/*/suggk.txt)
+    - Les exemples sont chargés depuis des fichiers texte (data/intents/*/suggk.txt)
   - Les embeddings sont calculés une seule fois au démarrage, puis mis en cache
   - La classification est synchrone et rapide (~5-15ms sur GPU)
 
 Architecture scalable : ajouter un nouveau intent = créer un dossier
-  src/chatbot/intents/<nom_intent>/suggk.txt
+    data/intents/<nom_intent>/suggk.txt
 et définir son tier dans INTENT_TIERS.
 
 Intents disponibles (classés par tier) :
@@ -76,7 +76,7 @@ from loguru import logger
 # Chemins
 # ─────────────────────────────────────────────────────────────────────────────
 
-INTENTS_DIR = Path(__file__).resolve().parent / "intents"
+INTENTS_DIR = Path(__file__).resolve().parents[2] / "data" / "intents"
 
 # Modèle de fallback standalone (même modèle que le pipeline principal)
 _STANDALONE_EMBEDDING_MODEL = "BAAI/bge-m3"
@@ -133,10 +133,10 @@ class IntentClassifier:
     Classifie l'intent d'une requête utilisateur par similarité cosinus
     sur les embeddings BGE-M3 des exemples d'entraînement.
 
-    Chaque intent correspond à un dossier dans src/chatbot/intents/ contenant
+    Chaque intent correspond à un dossier dans data/intents/ contenant
     un fichier suggk.txt avec un exemple par ligne.
 
-    Scalabilité : ajouter un dossier intents/<nom>/suggk.txt et son tier
+    Scalabilité : ajouter un dossier data/intents/<nom>/suggk.txt et son tier
     dans INTENT_TIERS. Le classifier le détectera automatiquement au prochain
     chargement.
 
@@ -233,7 +233,7 @@ class IntentClassifier:
 
     def _load_examples(self) -> None:
         """
-        Lit tous les fichiers intents/*/suggk.txt, calcule les embeddings
+        Lit tous les fichiers data/intents/*/suggk.txt, calcule les embeddings
         et construit la matrice de similarité en RAM.
         """
         start = time.perf_counter()

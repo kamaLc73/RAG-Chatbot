@@ -187,13 +187,31 @@ class VideoRetriever:
         )
         logger.info("Reranker chargé: {}", model_name)
 
-    # ─── API publique ──────────────────────────────────────────────────────────
+    # ─── Filtrage par organisme ───────────────────────────────
+
+    def _build_org_filter(self, org: str, doc_type: str) -> dict:
+        """
+        Construit le filtre ChromaDB WHERE selon l'organisme actif.
+        
+        - org="all"  → filtre sur type uniquement
+        - org="cnra" | "rcar" → filtre $and type + org (inclut 'both')
+        """
+        if org == "all":
+            return {"type": {"$eq": doc_type}}
+        return {
+            "$and": [
+                {"type": {"$eq": doc_type}},
+                {"org":  {"$in": [org, "both"]}},
+            ]
+        }
+
+    # ─── API publique ────────────────────────────────────────────
 
     @property
     def available(self) -> bool:
         return self._available
 
-    def retrieve(self, query: str) -> list[dict]:
+    def retrieve(self, query: str, org: str = "all") -> list[dict]:
         """
         Retourne les vidéos pertinentes pour une requête.
         Retourne [] si le retriever n'est pas disponible ou si aucun résultat pertinent.
@@ -205,12 +223,12 @@ class VideoRetriever:
         if not query:
             return []
 
-        # 1. Recherche vectorielle — filtrée sur type=video uniquement
+        # 1. Recherche vectorielle — filtrée sur type=video + org
         try:
             docs = self.vectorstore.similarity_search(
                 query,
                 k=self.top_k_retrieve,
-                filter={"type": "video"},
+                filter=self._build_org_filter(org, "video"),
             )
             logger.debug("--- CHUNKS RECUPÉRÉS AVANT RERANKING ---")
             for i, doc in enumerate(docs):

@@ -25,8 +25,10 @@ Champs retournés par query() — TOUJOURS présents (succès ET erreur) :
 from __future__ import annotations
 
 import os
+import re
 import sys
 import time
+import unicodedata
 import warnings
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
@@ -112,6 +114,42 @@ RAG_FINAL_K           = 4     # Chunks finaux après reranking
 RAG_MAX_CONTEXT_CHARS = 2800
 RAG_MAX_DOC_CHARS     = 700
 RAG_CACHE_SIZE        = 100
+
+# ── Mots-cles off-scope par organisme (texte normalise ASCII) ───────────────
+CNRA_KEYWORDS = {
+    "cnra",
+    "recore",
+    "assurance vie",
+    "accident du travail",
+    "accident travail",
+    "rente accident travail",
+    "rente circulation",
+    "rente accident",
+    "rentes viageres",
+    "rente viagere",
+    "rente at cnra",
+    "rentes at cnra",
+    "fram",
+    "crac",
+    "douayer zmane",
+    "ihtiyate",
+}
+
+RCAR_KEYWORDS = {
+    "rcar",
+    "retraite complementaire",
+    "agents non titulaires",
+    "regime collectif d allocation de retraite",
+    "allocation de retraite",
+    "retraite rcar",
+    "pension rcar",
+    "ehtiyati",
+    "regime general rcar",
+    "regime complementaire rcar",
+    "cotisation rcar",
+    "affiliation rcar",
+    "pension complementaire",
+}
 
 
 class RAGPipeline:
@@ -300,15 +338,72 @@ class RAGPipeline:
             "cached":            False,
         }
 
+    def _build_org_identity(self, org: str) -> str:
+        """
+        Génère le bloc d'identité org-spécifique pour le prompt système.
+        Injecte clairement au LLM son rôle et ses limites selon l'org actif.
+        """
+        if org == "cnra":
+            return (
+                "VOTRE IDENTITE ET SCOPE:\n"
+                "Vous etes l'assistant officiel de la CNRA (Caisse Nationale de Retraites et d'Assurances).\n"
+                "DEFINITION CNRA:\n"
+                "- Etablissement public gerant les rentes d'accidents du travail et de circulation,\n"
+                "  les rentes viageres et les produits d'assurance-vie au Maroc (branche CDG).\n"
+                "\n"
+                "Vous repondez UNIQUEMENT sur les sujets CNRA :\n"
+                "  - Rentes d'accidents du travail et de circulation\n"
+                "  - Rentes viageres et produits d'assurance-vie\n"
+                "  - Procedures et demarches CNRA\n"
+                "\n"
+                "RESTRICTIONS STRICTES :\n"
+                "- Vous n'etes PAS l'assistant du RCAR.\n"
+                "- Si l'utilisateur pose une question EXCLUSIVEMENT sur le RCAR (retraite complementaire agents non titulaires),\n"
+                "  repondez : 'Cette question concerne le RCAR, pas la CNRA. Je suis l'assistant CNRA uniquement.\n"
+                "  Consultez le site rcar.ma ou l'assistant RCAR pour cette demande.'\n"
+                "- N'ajoutez AUCUNE information sur le RCAR dans votre reponse."
+            )
+        elif org == "rcar":
+            return (
+                "VOTRE IDENTITE ET SCOPE:\n"
+                "Vous etes l'assistant officiel du RCAR (Regime Collectif d'Allocation de Retraite).\n"
+                "DEFINITION RCAR:\n"
+                "- Regime de retraite complementaire destine aux agents non titulaires de l'Etat,\n"
+                "  des collectivites locales et au personnel des etablissements publics.\n"
+                "\n"
+                "Vous repondez UNIQUEMENT sur les sujets RCAR :\n"
+                "  - Retraite complementaire pour agents non titulaires\n"
+                "  - Regimes general et complementaire du RCAR\n"
+                "  - Demarches d'affiliation et de retraite\n"
+                "  - Procedures administratives RCAR\n"
+                "\n"
+                "RESTRICTIONS STRICTES :\n"
+                "- Vous n'etes PAS l'assistant de la CNRA.\n"
+                "- Si l'utilisateur pose une question EXCLUSIVEMENT sur la CNRA (rentes AT/circulation, assurance-vie),\n"
+                "  repondez : 'Cette question concerne la CNRA, pas le RCAR. Je suis l'assistant RCAR uniquement.\n"
+                "  Consultez le site cnra.ma ou l'assistant CNRA pour cette demande.'\n"
+                "- N'ajoutez AUCUNE information sur la CNRA dans votre reponse."
+            )
+        else:  # org == "all"
+            return (
+                "VOTRE IDENTITE ET SCOPE:\n"
+                "Vous etes l'assistant conjoint officiel du RCAR et de la CNRA.\n"
+                "DEFINITIONS:\n"
+                "- RCAR (Regime Collectif d'Allocation de Retraite) : retraite complementaire pour\n"
+                "  agents non titulaires de l'Etat et des collectivites locales.\n"
+                "- CNRA (Caisse Nationale de Retraites et d'Assurances) : rentes AT/circulation,\n"
+                "  rentes viageres, assurance-vie (branche CDG).\n"
+                "\n"
+                "DISTINCTIONS IMPORTANTES :\n"
+                "- Precisez toujours quel organisme concerne la reponse.\n"
+                "- Si une question concerne UN SEUL organisme, mentionnez-le clairement.\n"
+                "- Si une question concerne les DEUX, clarifiez les roles de chacun."
+            )
+
     def _system_prompt(self) -> str:
-        return """Vous etes un assistant virtuel officiel specialise dans les organismes de retraite et d'assurance marocains RCAR et CNRA.
+        return """Vous etes un assistant virtuel officiel.
 
-    DEFINITIONS:
-    - RCAR (Regime Collectif d'Allocation de Retraite) : regime de retraite complementaire destine aux agents non titulaires de l'Etat et des collectivites locales, ainsi qu'au personnel des etablissements publics.
-    - CNRA (Caisse Nationale de Retraites et d'Assurances) : etablissement public gerant les rentes d'accidents du travail, de circulation, les rentes viageres et les produits d'assurance-vie au Maroc. Gere par la CDG.
-
-    VOTRE ROLE:
-    Vous aidez les affilies, retraites, employeurs et citoyens marocains a comprendre leurs droits, demarches, prestations et procedures liees au RCAR et a la CNRA, en vous basant exclusivement sur les informations officielles extraites des sites rcar.ma et cnra.ma.
+    {org_identity}
 
     REGLES STRICTES:
     - Repondez uniquement en francais.
@@ -337,6 +432,82 @@ class RAGPipeline:
             logger.info("Warmup embeddings: {:.3f}s", time.perf_counter() - t)
         except Exception as exc:
             logger.warning("Warmup ignoré: {}", exc)
+
+    def _normalize_text(self, text: str) -> str:
+        normalized = unicodedata.normalize("NFKD", text or "")
+        normalized = "".join(ch for ch in normalized if not unicodedata.combining(ch))
+        normalized = normalized.lower()
+        normalized = re.sub(r"[^a-z0-9]+", " ", normalized)
+        return f" {normalized.strip()} "
+
+    def _contains_any_keyword(self, normalized_text: str, keywords: set[str]) -> bool:
+        return any(f" {kw} " in normalized_text for kw in keywords)
+
+    def _detect_offscope_org(self, query: str, org: str) -> str:
+        """
+        Detecte si la question concerne exclusivement l'autre organisme.
+        Retourne "cnra", "rcar" ou "" si rien de detecte.
+
+        Version conservative : ne bloque que si le mot-cle est present ET
+        suffisamment discriminant (longueur > 4 chars pour eviter les faux positifs).
+        """
+        if org == "all":
+            return ""
+        normalized = self._normalize_text(query)
+
+        # Seuil : ignorer les keywords trop courts (risque de faux positifs)
+        min_keyword_len = 5
+
+        if org == "rcar":
+            for kw in CNRA_KEYWORDS:
+                if len(kw) >= min_keyword_len and f" {kw} " in normalized:
+                    return "cnra"
+
+        if org == "cnra":
+            for kw in RCAR_KEYWORDS:
+                if len(kw) >= min_keyword_len and f" {kw} " in normalized:
+                    return "rcar"
+        return ""
+
+    def _offscope_response(self, org: str, target: str, original_query: str) -> dict:
+        if target == "cnra":
+            message = (
+                "Cette question concerne la CNRA, pas le RCAR. Je suis l'assistant RCAR uniquement. "
+                "Consultez le site cnra.ma ou l'assistant CNRA pour cette demande."
+            )
+        else:
+            message = (
+                "Cette question concerne le RCAR, pas la CNRA. Je suis l'assistant CNRA uniquement. "
+                "Consultez le site rcar.ma ou l'assistant RCAR pour cette demande."
+            )
+
+        return {
+            "response":          message,
+            "context_docs":      0,
+            "videos":            [],
+            "forms":             [],
+            "intent":            "out_of_scope",
+            "intent_confidence": 1.0,
+            "original_query":    original_query,
+            "cached":            False,
+            "org":               org,
+        }
+
+    def _build_org_filter(self, org: str, doc_type: str) -> dict:
+        """
+        Construit le filtre ChromaDB WHERE selon l'organisme actif.
+        
+        - org="all"  → filtre sur type uniquement
+        - org="cnra" | "rcar" → filtre $and type + org (inclut 'both')
+        """
+        if org == "all":
+            return {"type": {"$eq": doc_type}}
+        return {
+            "$and": [
+                {"type": {"$eq": doc_type}},
+                {"org":  {"$in": [org, "both"]}},
+            ]
+        }
 
     def _build_supplementary_hint(self, videos: list, forms: list) -> str:
         """
@@ -383,7 +554,7 @@ class RAGPipeline:
         while len(self.response_cache) > RAG_CACHE_SIZE:
             self.response_cache.popitem(last=False)
 
-    def _retrieve_and_rerank_docs(self, query: str) -> list:
+    def _retrieve_and_rerank_docs(self, query: str, org: str = "all") -> list:
         """
         Recherche vectorielle sur chroma_db + reranking cross-encoder.
 
@@ -395,11 +566,11 @@ class RAGPipeline:
         Si le reranker est indisponible, retourne les RAG_FINAL_K premiers
         résultats vectoriels (comportement identique à avant).
         """
-        # Étape 1 — pool vectoriel élargi, filtré sur type=doc uniquement
+        # Étape 1 — pool vectoriel élargi, filtré sur type=doc + org
         candidates = self.vectorstore.similarity_search(
             query,
             k=self.retrieval_k,
-            filter={"type": "doc"},
+            filter=self._build_org_filter(org, "doc"),
         )
 
         if not candidates:
@@ -439,33 +610,34 @@ class RAGPipeline:
         # Fallback : pas de reranker → top RAG_FINAL_K résultats vectoriels
         return candidates[: self.final_k]
 
-    def _retrieve_videos(self, query: str) -> list[dict]:
+    def _retrieve_videos(self, query: str, org: str = "all") -> list[dict]:
         if not self.video_retriever or not self.video_retriever.available:
             return []
         try:
-            return self.video_retriever.retrieve(query)
+            return self.video_retriever.retrieve(query, org=org)
         except Exception as exc:
             logger.warning("Erreur recherche vidéo: {}", exc)
             return []
 
-    def _retrieve_forms(self, query: str) -> list[dict]:
+    def _retrieve_forms(self, query: str, org: str = "all") -> list[dict]:
         if not self.form_retriever or not self.form_retriever.available:
             return []
         try:
-            return self.form_retriever.retrieve(query)
+            return self.form_retriever.retrieve(query, org=org)
         except Exception as exc:
             logger.warning("Erreur recherche formulaires: {}", exc)
             return []
 
     # ── API publique ──────────────────────────────────────────────────────────
 
-    def query(self, query: str) -> dict:
+    def query(self, query: str, org: str = "all") -> dict:
         """
-        Traite une question utilisateur.
+        Traite une question utilisateur avec filtrage par organisme.
 
         Retourne TOUJOURS un dict avec les clés :
             response, context_docs, videos, forms, intent, intent_confidence,
-            original_query, cached.
+            original_query, org, cached.
+        La valeur intent peut etre "out_of_scope" en cas de blocage.
         La clé "error": True est ajoutée en cas d'échec.
         """
         cleaned = (query or "").strip()
@@ -475,10 +647,18 @@ class RAGPipeline:
                 query,
             )
 
+        # ── Off-scope guard (evite reponses CNRA/RCAR dans le mauvais mode) ──
+        offscope = self._detect_offscope_org(cleaned, org)
+        if offscope:
+            logger.info("Off-scope detecte (org={}, cible={})", org, offscope)
+            return self._offscope_response(org, offscope, query)
+
         # ── Cache ─────────────────────────────────────────────────────────────
+        # Clé de cache incluant l'org (évite les collisions inter-orgs)
+        cache_key = f"{org}:{cleaned.lower()}"
         # Renommé 'hit' pour éviter la collision de nom avec la clé "cached"
         # du payload retourné dans le dict déballé juste après.
-        if hit := self._cache_get(cleaned.lower()):
+        if hit := self._cache_get(cache_key):
             return {**hit, "original_query": query, "cached": True}
 
         if self.collection_count == 0:
@@ -490,11 +670,11 @@ class RAGPipeline:
         # ── Retrieval + reranking documentaire ───────────────────────────────
         t0 = time.perf_counter()
         try:
-            docs    = self._retrieve_and_rerank_docs(cleaned)
+            docs    = self._retrieve_and_rerank_docs(cleaned, org=org)
             context = self._build_context(docs)
             logger.info(
-                "Retrieval+reranking docs: {} chunks en {:.3f}s",
-                len(docs), time.perf_counter() - t0,
+                "Retrieval+reranking docs: {} chunks (org={}) en {:.3f}s",
+                len(docs), org, time.perf_counter() - t0,
             )
         except Exception as exc:
             logger.error("Erreur retrieval: {}", exc)
@@ -535,8 +715,8 @@ class RAGPipeline:
         t_par = time.perf_counter()
         try:
             with ThreadPoolExecutor(max_workers=2) as pool:
-                fut_v = pool.submit(self._retrieve_videos, cleaned) if run_videos else None
-                fut_f = pool.submit(self._retrieve_forms, cleaned) if run_forms else None
+                fut_v = pool.submit(self._retrieve_videos, cleaned, org) if run_videos else None
+                fut_f = pool.submit(self._retrieve_forms, cleaned, org) if run_forms else None
                 videos = fut_v.result(timeout=30) if fut_v else []
                 forms  = fut_f.result(timeout=30) if fut_f else []
             logger.info(
@@ -548,18 +728,20 @@ class RAGPipeline:
         except Exception as exc:
             logger.warning("Parallel retrieval échoué (fallback séquentiel): {}", exc)
             if run_videos:
-                videos = self._retrieve_videos(cleaned)
+                videos = self._retrieve_videos(cleaned, org)
             if run_forms:
-                forms = self._retrieve_forms(cleaned)
+                forms = self._retrieve_forms(cleaned, org)
 
         # ── Génération LLM ────────────────────────────────────────────────────
         t1 = time.perf_counter()
         try:
             supplementary_hint = self._build_supplementary_hint(videos, forms)
+            org_identity = self._build_org_identity(org)
             response = str(self.chain.invoke({
                 "context":            context,
                 "question":           cleaned,
                 "supplementary_hint": supplementary_hint,
+                "org_identity":       org_identity,
             })).strip()
             logger.info("Generation: {:.3f}s | {} chars", time.perf_counter() - t1, len(response))
         except Exception as exc:
@@ -582,8 +764,9 @@ class RAGPipeline:
             "forms":             forms,
             "intent":            classification.get("intent", "retrieval"),
             "intent_confidence": classification.get("confidence", 0.0),
+            "org":               org,
         }
-        self._cache_set(cleaned.lower(), payload)
+        self._cache_set(cache_key, payload)
         return {**payload, "original_query": query, "cached": False}
 
 

@@ -69,7 +69,7 @@ def build_documents(forms: list[dict]) -> list:
         form_id  = form.get("form_id", "")
         title    = form.get("title",    "Formulaire CNRA/RCAR")
         category = form.get("category", "")
-        org      = form.get("org",      "")
+        org      = form.get("org", "").strip().lower()  # normaliser majuscules → minuscules
         desc     = form.get("description", "")
 
         # Texte PDF : charger depuis le .txt si disponible

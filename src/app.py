@@ -25,17 +25,38 @@ if "logger_initialized" not in st.session_state:
     st.session_state["logger_initialized"] = True
 
 
-def get_welcome_message() -> str:
-    return (
-        "Bonjour. Je suis votre assistant RCAR/CNRA. "
-        "Posez-moi une question sur vos droits, démarches ou formulaires."
-    )
+# ── Constantes UI par organisme ───────────────────────────────────────────────
+ORG_LABELS = {
+    "all":  "RCAR & CNRA",
+    "rcar": "RCAR",
+    "cnra": "CNRA",
+}
+ORG_TITLES = {
+    "all":  "Assistant RCAR / CNRA",
+    "rcar": "Assistant RCAR",
+    "cnra": "Assistant CNRA",
+}
+ORG_SUBTITLES = {
+    "all":  "Interface Chatbot — sites RCAR et CNRA",
+    "rcar": "Régime Collectif d'Allocation de Retraite",
+    "cnra": "Caisse Nationale de Retraites et d'Assurances",
+}
+ORG_WELCOME = {
+    "all":  "Bonjour. Je suis votre assistant RCAR/CNRA. Posez-moi une question sur vos droits, démarches ou formulaires.",
+    "rcar": "Bonjour. Je suis votre assistant RCAR. Je réponds à vos questions sur le régime de retraite complémentaire.",
+    "cnra": "Bonjour. Je suis votre assistant CNRA. Je réponds à vos questions sur les rentes, assurances et prestations.",
+}
+
+
+def get_welcome_message(org: str = "all") -> str:
+    return ORG_WELCOME.get(org, ORG_WELCOME["all"])
 
 
 # ── Session state ─────────────────────────────────────────────────────────────
 if "theme"      not in st.session_state: st.session_state["theme"] = "dark"
+if "selected_org" not in st.session_state: st.session_state["selected_org"] = "all"
 if "history"    not in st.session_state:
-    st.session_state["history"] = [{"type": "bot", "content": get_welcome_message(), "videos": [], "forms": []}]
+    st.session_state["history"] = [{"type": "bot", "content": get_welcome_message("all"), "videos": [], "forms": []}]
 if "processing"        not in st.session_state: st.session_state["processing"] = False
 if "show_typewriter"   not in st.session_state: st.session_state["show_typewriter"] = False
 if "typewriter_message" not in st.session_state: st.session_state["typewriter_message"] = ""
@@ -217,6 +238,27 @@ st.markdown(theme_css, unsafe_allow_html=True)
 
 # ── Sidebar ───────────────────────────────────────────────────────────────────
 with st.sidebar:
+    st.markdown("### Organisme")
+    org = st.session_state["selected_org"]
+    for org_key in ("all", "rcar", "cnra"):
+        if st.button(
+            ORG_LABELS[org_key],
+            key=f"org_btn_{org_key}",
+            use_container_width=True,
+            type="primary" if st.session_state["selected_org"] == org_key else "secondary",
+        ):
+            if st.session_state["selected_org"] != org_key:
+                st.session_state["selected_org"] = org_key
+                # Réinitialiser la conversation au changement d'org
+                st.session_state["history"] = [{
+                    "type": "bot",
+                    "content": get_welcome_message(org_key),
+                    "videos": [],
+                    "forms": [],
+                }]
+                st.rerun()
+    
+    st.markdown("---")
     st.markdown("### Paramètres")
     if st.button("Mode sombre" if dark else "Mode clair", key="theme_toggle"):
         toggle_theme()
@@ -224,7 +266,7 @@ with st.sidebar:
     st.markdown("---")
     st.markdown("### Réinitialisation")
     if st.button("Effacer l'historique", type="secondary"):
-        st.session_state["history"] = [{"type": "bot", "content": get_welcome_message(), "videos": [], "forms": []}]
+        st.session_state["history"] = [{"type": "bot", "content": get_welcome_message(st.session_state["selected_org"]), "videos": [], "forms": []}]
         st.session_state["show_typewriter"] = False
         st.session_state["typewriter_message"] = ""
         st.session_state["processing"] = False
@@ -234,13 +276,13 @@ with st.sidebar:
 
 
 # ── Titre ─────────────────────────────────────────────────────────────────────
+org = st.session_state["selected_org"]
 st.markdown(
-    f"<h1 style='color:{title_color};margin-bottom:0.2rem;'>Assistant RCAR/CNRA</h1>",
+    f"<h1 style='color:{title_color};margin-bottom:0.2rem;'>{ORG_TITLES[org]}</h1>",
     unsafe_allow_html=True,
 )
 st.markdown(
-    f"<p style='font-size:1rem;color:{subtitle_color};margin-bottom:1.2rem;'>"
-    "Interface Chatbot — sites RCAR et CNRA</p>",
+    f"<p style='font-size:1rem;color:{subtitle_color};margin-bottom:1.2rem;'>{ORG_SUBTITLES[org]}</p>",
     unsafe_allow_html=True,
 )
 
@@ -508,7 +550,7 @@ if (
     if user_msg:
         try:
             rag    = load_rag_pipeline()
-            result = rag.query(query=user_msg["content"])
+            result = rag.query(query=user_msg["content"], org=st.session_state["selected_org"])
             response = result.get("response") or str(result)
             videos   = result.get("videos") or []
             forms    = result.get("forms")  or []
