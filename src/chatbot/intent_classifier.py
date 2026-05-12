@@ -122,7 +122,7 @@ FORM_RETRIEVER_INTENTS = {"needs_form", "procedural", "administrative_declaratio
 
 # Seuil de confiance minimum pour appliquer le gate
 # En dessous, on laisse passer (comportement conservateur)
-GATE_CONFIDENCE_THRESHOLD = 0.45
+GATE_CONFIDENCE_THRESHOLD = 0.60
 
 # Nombre de voisins pour le vote majoritaire
 TOP_K = 7
@@ -408,6 +408,24 @@ class IntentClassifier:
             ]
             confidence = float(np.mean(winner_scores)) if winner_scores else 0.0
             tier = self.intent_tier_map.get(winner, 1)
+
+            # ── Fallback retrieval sur faible confiance ───────────────────────
+            # Si l'intent gagnant n'est pas "retrieval" mais sa confiance est
+            # insuffisante (< 0.60), on retombe sur "retrieval" pour ne pas
+            # bloquer une vraie question documentaire.
+            # Ex : "C'est quoi un RECORE ?" classé "greeting" à 0.49 → retrieval
+            RETRIEVAL_FALLBACK_THRESHOLD = 0.60
+            NON_DOC_INTENTS = {
+                "greeting", "chitchat", "out_of_scope",
+                "conversational_fallback", "feedback",
+            }
+            if winner in NON_DOC_INTENTS and confidence < RETRIEVAL_FALLBACK_THRESHOLD:
+                logger.info(
+                    "IntentClassifier fallback retrieval : '{}' conf={:.3f} < {:.2f} → retrieval",
+                    winner, confidence, RETRIEVAL_FALLBACK_THRESHOLD,
+                )
+                winner = "retrieval"
+                tier = self.intent_tier_map.get("retrieval", 1)
 
             elapsed_ms = (time.perf_counter() - start) * 1000
 

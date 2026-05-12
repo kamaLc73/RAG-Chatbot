@@ -101,7 +101,7 @@ OLLAMA_MODEL       = getenv("OLLAMA_MODEL", "mistral:latest").strip().strip('"\'
 OLLAMA_BASE_URL    = getenv("OLLAMA_BASE_URL", "http://localhost:11434")
 OLLAMA_API_KEY     = getenv("OLLAMA_API_KEY", "").strip().strip('"\'')
 OLLAMA_TEMPERATURE = 0.1
-OLLAMA_NUM_PREDICT = 600
+OLLAMA_NUM_PREDICT = 1200
 OLLAMA_NUM_CTX     = 4096
 OLLAMA_KEEP_ALIVE  = "30m"
 
@@ -111,8 +111,8 @@ OLLAMA_KEEP_ALIVE  = "30m"
 # Règle : RAG_RETRIEVE_K >= RAG_FINAL_K (typiquement 3x)
 RAG_RETRIEVE_K        = 12    # Pool élargi pour donner du choix au reranker
 RAG_FINAL_K           = 4     # Chunks finaux après reranking
-RAG_MAX_CONTEXT_CHARS = 2800
-RAG_MAX_DOC_CHARS     = 700
+RAG_MAX_CONTEXT_CHARS = 4000
+RAG_MAX_DOC_CHARS     = 1000
 RAG_CACHE_SIZE        = 100
 
 # ── Mots-cles off-scope par organisme (texte normalise ASCII) ───────────────
@@ -420,7 +420,8 @@ class RAGPipeline:
     - Reponses structurees en phrases courtes et claires.
     - Pour les listes, commencez chaque element par "- " sur une nouvelle ligne.
     - Longueur adaptee a la question.
-    - Si des videos ou formulaires sont disponibles (indiques dans RESSOURCES SUPPLEMENTAIRES), mentionnez-les brievement a la fin de votre reponse. Ne dites JAMAIS que vous n'avez pas de video ou formulaire si des ressources sont disponibles.
+    - Si des videos ou formulaires sont disponibles (indiques dans RESSOURCES SUPPLEMENTAIRES), mentionnez-les brievement a la fin de votre reponse.
+    - Si AUCUNE ressource n'est disponible, ne mentionnez PAS les videos ou formulaires. Ne dites JAMAIS \"aucune video\", \"aucun formulaire\" ou toute phrase similaire indiquant leur absence.
 
     CONTEXTE DOCUMENTAIRE:
     {context}"""
@@ -529,7 +530,7 @@ class RAGPipeline:
                 f"a l'utilisateur avec un lien de telechargement."
             )
         if not parts:
-            return "Aucune video ni formulaire n'a ete trouve pour cette question."
+            return "Aucune ressource supplementaire disponible. Ne mentionnez PAS les videos ou formulaires dans votre reponse."
         return " ".join(parts)
 
     def _build_context(self, docs: list) -> str:

@@ -23,11 +23,56 @@ Design :
 
 import io
 import os
+import re
 import sys
 import tempfile
 from pathlib import Path
 
 from loguru import logger
+
+# ── Vocabulaire domaine injecté dans Whisper (initial_prompt) ─────────────────
+# Whisper utilise ce texte comme contexte de départ pour biaiser la reconnaissance
+# vers les termes métier RCAR/CNRA plutôt que leurs homophones courants.
+# Ex : "RECORE" vs "record", "RCAR" vs "r'car", "CNRA" vs "sénar"…
+DOMAIN_INITIAL_PROMPT = (
+    "RCAR, CNRA, RECORE, CDG, FRAM, CRAC, retraite, pension, cotisation, "
+    "allocation de retraite, affilié, non-titulaire, titulaire, rente viagère, "
+    "invalidité, vieillesse, décès, pécule, liquidation, rachat, Dahir, "
+    "branche épargne prévoyance, Caisse de Dépôt et de Gestion, "
+    "collectivité locale, accident du travail, rente AT."
+)
+
+# ── Corrections post-transcription (homophones connus) ───────────────────────
+# Dictionnaire général : {transcription_erronee_minuscule: terme_correct}
+# Ajouter ici tout nouveau conflit détecté — solution générale et extensible.
+DOMAIN_CORRECTIONS: dict = {
+    # RECORE (produit CNRA) ← confondu avec le mot courant "record"
+    "record":   "RECORE",
+    "décor":    "RECORE",
+    "recor":    "RECORE",
+    "le core":  "RECORE",
+    "re-core":  "RECORE",
+    "re core":  "RECORE",
+    # RCAR ← variantes phonétiques
+    "r car":    "RCAR",
+    "r-car":    "RCAR",
+    "ercar":    "RCAR",
+    "ar car":   "RCAR",
+    # CNRA ← variantes phonétiques
+    "c n r a":  "CNRA",
+    "sénar":    "CNRA",
+    "senra":    "CNRA",
+    # FRAM
+    "frame":    "FRAM",
+    # CRAC ← confondu avec "crack"
+    "crack":    "CRAC",
+    # CDG
+    "c d g":    "CDG",
+    "cédégé":   "CDG",
+    # Dahir
+    "da hier":  "Dahir",
+    "dahier":   "Dahir",
+}
 
 src_root = Path(__file__).resolve().parents[1]
 if str(src_root) not in sys.path:

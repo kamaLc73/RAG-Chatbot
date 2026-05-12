@@ -335,6 +335,19 @@ theme_css = f"""
         border:1px solid {form_card_border};opacity:0.8;
     }}
     .form-action-btn:hover {{ opacity:0.8; }}
+
+    .bot-message a, .typewriter-message a {{
+    color: {"#4db88a" if dark else "#0f5132"};
+    text-decoration: underline;
+    font-weight: 500;
+    }}
+    .bot-message a:hover, .typewriter-message a:hover {{
+        opacity: 0.8;
+    }}
+    .bot-message strong, .typewriter-message strong {{
+        font-weight: 700;
+        color: {bot_msg_color};
+    }}
 </style>
 """
 
@@ -428,12 +441,30 @@ def preload_rag_pipeline() -> None:
 def render_plain_text(text: str) -> str:
     if not text:
         return ""
-    text = re.sub(r'\*\*(.*?)\*\*', r'\1', text)
-    text = re.sub(r'\*(.*?)\*',     r'\1', text)
-    text = re.sub(r'#{1,6}\s*',     '',    text)
+    # Headers → texte simple
+    text = re.sub(r'#{1,6}\s*', '', text)
+    # Code inline
     text = re.sub(r'`{1,3}(.*?)`{1,3}', r'\1', text, flags=re.DOTALL)
+    # Séparateurs
     text = re.sub(r'---+', '─' * 30, text)
+    # Liens Markdown [texte](url) → HTML cliquable (avant l'escape)
+    text = re.sub(
+        r'\[([^\]]+)\]\((https?://[^\)]+)\)',
+        r'<LINK_START href="\2" target="_blank" rel="noopener noreferrer">\1<LINK_END>',
+        text,
+    )
+    # Escape HTML (protège le reste du texte)
     text = html.escape(text)
+    # Restaure les balises <a> après l'escape
+    text = text.replace('&lt;LINK_START ', '<a ')
+    text = text.replace('&gt;', '>', 1) if '&lt;LINK_START' in text else text
+    text = re.sub(r'&lt;LINK_START (.*?)&gt;', r'<a \1>', text)
+    text = text.replace('&lt;LINK_END&gt;', '</a>')
+    # Gras **texte** → <strong>
+    text = re.sub(r'\*\*(.*?)\*\*', r'<strong>\1</strong>', text)
+    # Italique *texte* → <em>  (après le gras pour éviter les conflits)
+    text = re.sub(r'\*([^\*]+)\*', r'<em>\1</em>', text)
+    # Sauts de ligne
     text = text.replace("\n", "<br>")
     return text
 
