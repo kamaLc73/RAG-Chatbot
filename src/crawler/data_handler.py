@@ -28,34 +28,10 @@ AR_PATH_RE = re.compile(r"(^|/)ar(/|$)", re.I)
 FR_PATH_RE = re.compile(r"(^|/)fr(/|$)", re.I)
 
 
-def read_json_file(path: Path) -> dict | None:
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        return data if isinstance(data, dict) else None
-    except Exception:
-        return None
-
-
 def write_json_file(path: Path, data: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
-
-
-def unique_target_path(path: Path) -> Path:
-    if not path.exists():
-        return path
-
-    stem = path.stem
-    suffix = path.suffix
-    parent = path.parent
-    i = 1
-    while True:
-        candidate = parent / f"{stem}_moved{i}{suffix}"
-        if not candidate.exists():
-            return candidate
-        i += 1
 
 
 def path_language_hint(url: str) -> str | None:
@@ -63,21 +39,6 @@ def path_language_hint(url: str) -> str | None:
     if AR_PATH_RE.search(path):
         return "ar"
     if FR_PATH_RE.search(path):
-        return "fr"
-    return None
-
-
-def detect_script_language(text: str | None) -> str | None:
-    sample = (text or "").strip()
-    if len(sample) < 30:
-        return None
-
-    arabic_count = len(ARABIC_CHAR_RE.findall(sample))
-    latin_count = len(LATIN_CHAR_RE.findall(sample))
-
-    if arabic_count >= 18 and arabic_count >= int(latin_count * 1.2):
-        return "ar"
-    if latin_count >= 18 and latin_count >= int(arabic_count * 1.2):
         return "fr"
     return None
 
@@ -179,33 +140,6 @@ def extract_page_metadata(soup: BeautifulSoup) -> dict:
         meta["language"] = "unknown"
 
     return meta
-
-
-def infer_simple_language(
-    url: str,
-    text: str | None,
-    title: str | None = None,
-    html_language: str | None = None,
-    fallback: str = "unknown",
-) -> tuple[str, str]:
-    combined_text = f"{title or ''}\n{text or ''}"
-    by_script = detect_script_language(combined_text)
-    if by_script:
-        return by_script, "title_content_script"
-
-    lang_hint = (html_language or "").strip().lower()
-    if lang_hint.startswith("ar"):
-        return "ar", "html_lang"
-    if lang_hint.startswith("fr"):
-        return "fr", "html_lang"
-
-    path_hint = path_language_hint(url)
-    if path_hint:
-        return path_hint, "url_path"
-
-    if fallback in {"fr", "ar", "unknown"}:
-        return fallback, "fallback"
-    return "unknown", "fallback"
 
 
 def normalize_language_hint(value: str | None) -> str:

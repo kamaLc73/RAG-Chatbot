@@ -1,0 +1,53 @@
+schema form {
+  document form {
+    field form_id type string {
+      indexing: summary | attribute
+    }
+    field title type string {
+      indexing: index | summary
+      index { enable-bm25 }
+    }
+    field category type string {
+      indexing: index | summary | attribute
+      index { enable-bm25 }
+    }
+    field content type string {
+      indexing: index | summary
+      index { enable-bm25 }
+    }
+    field org type string {
+      indexing: summary | attribute
+      rank: filter
+    }
+    field pdf_url type string {
+      indexing: summary | attribute
+    }
+    field page_url type string {
+      indexing: summary | attribute
+    }
+    field embedding type tensor<float>(x[1024]) {
+      indexing: attribute | index
+      attribute { distance-metric: angular }
+      index {
+        hnsw {
+          max-links-per-node: 16
+          neighbors-to-explore-at-insert: 200
+        }
+      }
+    }
+  }
+
+  rank-profile hybrid inherits default {
+    inputs {
+      query(q_embedding) tensor<float>(x[1024])
+    }
+    first-phase {
+      expression: 0.5 * closeness(field, embedding) + 0.3 * bm25(title) + 0.2 * bm25(category)
+    }
+    second-phase {
+      rerank-count: 10
+      expression: 0.4 * closeness(field, embedding) + 0.3 * bm25(title) + 0.2 * bm25(content) + 0.1 * bm25(category)
+    }
+    match-features: closeness(field, embedding) bm25(title)
+  }
+}

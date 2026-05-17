@@ -1,19 +1,23 @@
 from pathlib import Path
+import os
+from dotenv import load_dotenv
 
 # ─────────────────────────────────────────────
 # CHEMINS RACINE
 # ─────────────────────────────────────────────
 # settings.py est dans src/config, donc la racine projet est 3 niveaux au-dessus.
 BASE_DIR = Path(__file__).resolve().parent.parent.parent
+load_dotenv(BASE_DIR / ".env")
 DATA_DIR = BASE_DIR / "data"
 RAW_DIR  = DATA_DIR / "raw"
 LOGS_DIR = BASE_DIR / "logs"
 
 # ─────────────────────────────────────────────
-# VECTORSTORE UNIFIÉ
+# VESPA
 # ─────────────────────────────────────────────
-VECTORSTORE_DIR     = DATA_DIR / "vectorstore" / "chroma_db_unified"
-UNIFIED_COLLECTION  = "rcar_cnra_unified"
+VESPA_URL = os.getenv("VESPA_URL", "http://localhost")
+VESPA_PORT = int(os.getenv("VESPA_PORT", "8080"))
+VESPA_CONTENT_CLUSTER = os.getenv("VESPA_CONTENT_CLUSTER", "rcar_cnra")
 
 # ─────────────────────────────────────────────
 # SOURCES À CRAWLER

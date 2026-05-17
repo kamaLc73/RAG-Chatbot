@@ -1,0 +1,23 @@
+services:
+  vespa:
+    image: vespaengine/vespa:latest
+    container_name: vespa
+    hostname: vespa-container
+    ports:
+      - "8080:8080"
+      - "19071:19071"
+    volumes:
+      - vespa_data:/opt/vespa/var
+    mem_limit: 6g
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:19071/state/v1/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+
+volumes:
+  vespa_data:

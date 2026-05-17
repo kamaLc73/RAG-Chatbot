@@ -1,48 +1,41 @@
-"""
-src/indexing/index_data.py
-===========================
-Construit (ou met à jour) le vectorstore ChromaDB à partir des fichiers
-FAQ RCAR/CNRA stockés dans data/supportstagerag.
-
-Stratégie de mise à jour :
-    - La collection est PARTAGÉE avec les vidéos et les formulaires.
-    - Avant réindexation, SEULS les chunks type="doc" sont supprimés
-      (les chunks type="video" et type="form" sont préservés).
-    - La suppression est VÉRIFIÉE : si elle échoue ou est incomplète,
-      l'indexation est annulée pour éviter les doublons.
-"""
-# ── Compatibilité Python 3.8+ pour les annotations de type ───────────────────
 from __future__ import annotations
 
 import logging
 import os
-import shutil
+import sys
 from pathlib import Path
 
 from dotenv import load_dotenv
-from langchain_chroma import Chroma
 from langchain_core.documents import Document
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
+SRC_ROOT = PROJECT_ROOT / "src"
+if str(SRC_ROOT) not in sys.path:
+    sys.path.insert(0, str(SRC_ROOT))
+
+from store.vespa_store import delete_all_docs, feed_documents, make_vespa_app, stable_data_id
+
 load_dotenv(PROJECT_ROOT / ".env")
 LOG_DIR = PROJECT_ROOT / "logs"
 LOG_DIR.mkdir(parents=True, exist_ok=True)
 LOG_FILE = LOG_DIR / "index_data.log"
 
 TARGET_SITES = ("rcar", "cnra")
-TARGET_SOURCE_TYPES = ("faq",)
+TARGET_SOURCE_TYPES: tuple[str, ...] = ()
 TARGET_LANGUAGE = "fr"
 SUPPORTED_EXTENSIONS = (".md", ".txt")
 
 DEFAULT_EMBEDDING_MODEL = "BAAI/bge-m3"
 EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", DEFAULT_EMBEDDING_MODEL)
 DEFAULT_PROCESSED_ROOT = PROJECT_ROOT / "data" / "supportstagerag"
-DEFAULT_VECTORSTORE_DIR = PROJECT_ROOT / "data" / "vectorstore" / "chroma_db_unified"
+VESPA_URL = os.getenv("VESPA_URL", "http://localhost")
+VESPA_PORT = int(os.getenv("VESPA_PORT", "8080"))
+VESPA_CONTENT_CLUSTER = os.getenv("VESPA_CONTENT_CLUSTER", "rcar_cnra")
 
-DEFAULT_CHUNK_SIZE    = 1200  # Nombre de caractères par chunk
+DEFAULT_CHUNK_SIZE = 1200
 DEFAULT_CHUNK_OVERLAP = 180
 
 logging.basicConfig(
@@ -54,6 +47,8 @@ logging.basicConfig(
     ],
     force=True,
 )
+logging.getLogger("vespa").setLevel(logging.WARNING)
+logging.getLogger("vespa.application").setLevel(logging.WARNING)
 
 
 def _resolve_project_path(path_like):
@@ -72,9 +67,9 @@ def _list_supported_documents(folder: Path) -> list[Path]:
 
 
 def _resolve_embedding_device():
-    """Prefer CUDA when available, otherwise fallback to CPU."""
     try:
         import torch
+
         if torch.cuda.is_available():
             return "cuda"
     except Exception:
@@ -88,12 +83,12 @@ def analyze_processed_data(
     source_types=TARGET_SOURCE_TYPES,
     language=TARGET_LANGUAGE,
 ):
-    """Analyze FAQ file availability for the selected sites and source types."""
     root = _resolve_project_path(processed_root)
     summary = {}
 
     for site in sites:
-        for source_type in source_types:
+        selected_source_types = source_types or _discover_source_types(root, site)
+        for source_type in selected_source_types:
             folder = root / site / source_type
             key = f"{site}/{source_type}"
 
@@ -137,12 +132,12 @@ def collect_files(
     source_types=TARGET_SOURCE_TYPES,
     language=TARGET_LANGUAGE,
 ):
-    """Collect FAQ documents recursively for RCAR and CNRA."""
     root = _resolve_project_path(processed_root)
     collected = []
 
     for site in sites:
-        for source_type in source_types:
+        selected_source_types = source_types or _discover_source_types(root, site)
+        for source_type in selected_source_types:
             folder = root / site / source_type
             if not folder.exists():
                 logging.warning("Dossier absent: %s", folder)
@@ -150,18 +145,27 @@ def collect_files(
 
             files = _list_supported_documents(folder)
             collected.extend(files)
-            md_count  = sum(1 for file in files if file.suffix.lower() == ".md")
+            md_count = sum(1 for file in files if file.suffix.lower() == ".md")
             txt_count = sum(1 for file in files if file.suffix.lower() == ".txt")
             logging.info(
-                "%s: %s fichiers FAQ (md=%s, txt=%s)",
-                folder, len(files), md_count, txt_count,
+                "%s: %s fichiers support RAG (md=%s, txt=%s)",
+                folder,
+                len(files),
+                md_count,
+                txt_count,
             )
 
     return collected
 
 
+def _discover_source_types(root: Path, site: str) -> tuple[str, ...]:
+    site_dir = root / site
+    if not site_dir.exists():
+        return ()
+    return tuple(sorted(path.name for path in site_dir.iterdir() if path.is_dir()))
+
+
 def load_documents(file_paths, processed_root=DEFAULT_PROCESSED_ROOT):
-    """Load FAQ files into LangChain Document objects with metadata."""
     root = _resolve_project_path(processed_root)
     documents = []
 
@@ -178,34 +182,34 @@ def load_documents(file_paths, processed_root=DEFAULT_PROCESSED_ROOT):
         try:
             relative = file_path.resolve().relative_to(root)
             parts = relative.parts
-            site        = parts[0] if len(parts) > 0 else "unknown"
+            site = parts[0] if len(parts) > 0 else "unknown"
             source_type = parts[1] if len(parts) > 1 else "unknown"
-            faq_scope   = parts[2] if len(parts) > 2 else "unknown"
-            topic       = "/".join(parts[3:-1]) if len(parts) > 4 else ""
-            language    = TARGET_LANGUAGE
+            faq_scope = parts[2] if len(parts) > 2 else "unknown"
+            topic = "/".join(parts[3:-1]) if len(parts) > 4 else ""
+            language = TARGET_LANGUAGE
         except Exception:
-            relative    = file_path
-            site        = "unknown"
+            relative = file_path
+            site = "unknown"
             source_type = "unknown"
-            faq_scope   = "unknown"
-            topic       = ""
-            language    = TARGET_LANGUAGE
+            faq_scope = "unknown"
+            topic = ""
+            language = TARGET_LANGUAGE
 
         documents.append(
             Document(
                 page_content=text,
                 metadata={
-                    "source":          str(file_path.as_posix()),
+                    "source": str(file_path.as_posix()),
                     "relative_source": str(relative).replace("\\", "/"),
-                    "org":             site if site in ("cnra", "rcar") else "both",
-                    "type":            "doc",
-                    "site":            site,
-                    "source_type":     source_type,
-                    "faq_scope":       faq_scope,
-                    "faq_topic":       topic,
-                    "language":        language,
-                    "file_name":       file_path.name,
-                    "file_extension":  file_path.suffix.lower(),
+                    "org": site if site in ("cnra", "rcar") else "both",
+                    "type": "doc",
+                    "site": site,
+                    "source_type": source_type,
+                    "faq_scope": faq_scope,
+                    "faq_topic": topic,
+                    "language": language,
+                    "file_name": file_path.name,
+                    "file_extension": file_path.suffix.lower(),
                 },
             )
         )
@@ -214,7 +218,6 @@ def load_documents(file_paths, processed_root=DEFAULT_PROCESSED_ROOT):
 
 
 def build_chunker(chunk_size=DEFAULT_CHUNK_SIZE, chunk_overlap=DEFAULT_CHUNK_OVERLAP):
-    """Create a chunk splitter tuned for FAQ markdown/text files."""
     return RecursiveCharacterTextSplitter(
         chunk_size=chunk_size,
         chunk_overlap=chunk_overlap,
@@ -244,7 +247,6 @@ def chunk_documents(documents, chunk_size=DEFAULT_CHUNK_SIZE, chunk_overlap=DEFA
     splitter = build_chunker(chunk_size=chunk_size, chunk_overlap=chunk_overlap)
     chunks = splitter.split_documents(documents)
 
-    # Ajoute un index de chunk stable par fichier source.
     per_source_index: dict[str, int] = {}
     for chunk in chunks:
         source = chunk.metadata.get("relative_source", chunk.metadata.get("source", "unknown"))
@@ -255,61 +257,37 @@ def chunk_documents(documents, chunk_size=DEFAULT_CHUNK_SIZE, chunk_overlap=DEFA
     return chunks
 
 
-def _delete_doc_chunks(vectorstore: Chroma) -> None:
-    """
-    Supprime TOUS les chunks de type='doc' de la collection partagée,
-    puis vérifie que la suppression est complète.
-
-    La vérification en deux temps (count avant → delete → count après)
-    est essentielle car Chroma ne lève pas toujours d'exception en cas
-    d'échec partiel. Sans vérification, on risque d'accumuler des doublons
-    à chaque réindexation.
-
-    Raises:
-        RuntimeError: si la suppression est incomplète après l'appel.
-        Exception:    si une erreur inattendue survient lors du delete.
-    """
-    # Comptage des entrées existantes — include=[] pour éviter de rapatrier
-    # tout le contenu (on n'a besoin que des IDs).
-    result_before = vectorstore._collection.get(where={"type": "doc"}, include=[])
-    n_before = len(result_before.get("ids", []))
-
-    if n_before == 0:
-        logging.info(
-            "Aucun chunk type=doc dans la collection — première indexation ou collection vierge."
-        )
-        return
-
-    logging.info("Suppression de %d chunks type=doc avant réindexation...", n_before)
-    vectorstore._collection.delete(where={"type": "doc"})
-
-    # Vérification : s'assurer que plus aucun chunk doc ne subsiste
-    result_after = vectorstore._collection.get(where={"type": "doc"}, include=[])
-    n_after = len(result_after.get("ids", []))
-
-    if n_after > 0:
-        raise RuntimeError(
-            f"Suppression incomplète : {n_after}/{n_before} chunks type=doc toujours présents. "
-            f"Réindexation annulée pour éviter les doublons. "
-            f"Vérifiez l'état de la collection ChromaDB."
-        )
-
-    logging.info("Chunks type=doc supprimés avec succès : %d entrées retirées.", n_before)
+def _chunk_to_vespa_document(chunk: Document, embedding: list[float]) -> dict:
+    metadata = chunk.metadata
+    doc_id = stable_data_id(
+        "doc",
+        metadata.get("relative_source", metadata.get("source", "unknown")),
+        metadata.get("chunk_index", 0),
+    )
+    return {
+        "id": doc_id,
+        "fields": {
+            "doc_id": doc_id,
+            "text": chunk.page_content,
+            "org": metadata.get("org", "both"),
+            "source_type": metadata.get("source_type", "faq"),
+            "faq_scope": metadata.get("faq_scope", "unknown"),
+            "relative_source": metadata.get("relative_source", metadata.get("source", "")),
+            "chunk_index": int(metadata.get("chunk_index", 0)),
+            "embedding": embedding,
+        },
+    }
 
 
 def index_data(
     processed_root=DEFAULT_PROCESSED_ROOT,
-    persist_directory=DEFAULT_VECTORSTORE_DIR,
-    collection_name="rcar_cnra_unified",
+    vespa_url=VESPA_URL,
+    vespa_port=VESPA_PORT,
+    content_cluster=VESPA_CONTENT_CLUSTER,
     chunk_size=DEFAULT_CHUNK_SIZE,
     chunk_overlap=DEFAULT_CHUNK_OVERLAP,
+    reset: bool = True,
 ):
-    """
-    Construit (ou met à jour) le vectorstore ChromaDB à partir des FAQ RCAR/CNRA.
-
-    La collection est partagée avec les vidéos et formulaires — on ne supprime
-    que les chunks type='doc' avant de réindexer.
-    """
     analysis = analyze_processed_data(processed_root=processed_root)
     for bucket, stats in analysis.items():
         logging.info(
@@ -326,9 +304,7 @@ def index_data(
 
     file_paths = collect_files(processed_root=processed_root)
     if not file_paths:
-        raise ValueError(
-            "Aucun fichier FAQ (.md/.txt) trouve pour RCAR/CNRA dans data/supportstagerag."
-        )
+        raise ValueError("Aucun fichier (.md/.txt) trouve pour RCAR/CNRA dans data/supportstagerag.")
 
     documents = load_documents(file_paths, processed_root=processed_root)
     if not documents:
@@ -338,17 +314,11 @@ def index_data(
     if not chunks:
         raise ValueError("Aucun chunk genere. Verifiez les contenus FAQ md/txt.")
 
-    persist_path = _resolve_project_path(persist_directory)
-    persist_path.mkdir(parents=True, exist_ok=True)
-
     device = _resolve_embedding_device()
     hf_token = os.getenv("HF_TOKEN")
     logging.info("Embedding device utilise pour l'indexation: %s", device)
     if not hf_token:
-        logging.warning(
-            "HF_TOKEN non configure: telechargement Hugging Face en mode non authentifie "
-            "(limites plus strictes)."
-        )
+        logging.warning("HF_TOKEN non configure: telechargement Hugging Face en mode non authentifie.")
 
     model_kwargs: dict = {"device": device}
     if hf_token:
@@ -360,40 +330,34 @@ def index_data(
         encode_kwargs={"normalize_embeddings": True},
     )
 
-    # ── Suppression sécurisée des anciens chunks doc ───────────────────────────
-    # On ouvre la collection AVANT d'ajouter les nouveaux chunks pour pouvoir
-    # vérifier et supprimer les anciens. Si la suppression échoue (partielle ou
-    # totale), on lève une exception et on n'indexe rien — pas de doublons.
-    vectorstore = Chroma(
-        persist_directory=str(persist_path),
-        embedding_function=embeddings,
-        collection_name=collection_name,
-    )
+    app = make_vespa_app(vespa_url, vespa_port)
+    if reset:
+        logging.info("Suppression des documents Vespa schema=doc avant reindexation...")
+        delete_all_docs(app, "doc", content_cluster)
 
-    try:
-        _delete_doc_chunks(vectorstore)
-    except Exception as exc:
-        logging.error(
-            "Suppression des chunks doc échouée : %s — réindexation annulée.", exc
-        )
-        raise
+    logging.info("Calcul embeddings pour %s chunks support RAG...", len(chunks))
+    vectors = embeddings.embed_documents([chunk.page_content for chunk in chunks])
+    vespa_documents = [
+        _chunk_to_vespa_document(chunk, vector)
+        for chunk, vector in zip(chunks, vectors)
+    ]
 
-    # ── Indexation ────────────────────────────────────────────────────────────
-    vectorstore.add_documents(chunks)
+    logging.info("Feed Vespa schema=doc: %s documents...", len(vespa_documents))
+    fed = feed_documents(app, schema="doc", documents=vespa_documents)
 
-    logging.info("ChromaDB sauvegarde dans %s", persist_path)
-    logging.info("Collection: %s", collection_name)
+    logging.info("Vespa endpoint: %s:%s", vespa_url, vespa_port)
     logging.info("Documents charges: %s", len(documents))
-    logging.info("Chunks indexes: %s", len(chunks))
+    logging.info("Chunks indexes: %s", fed)
     logging.info("Chunk size=%s | overlap=%s", chunk_size, chunk_overlap)
 
     return {
-        "persist_directory": str(persist_path),
-        "collection_name":   collection_name,
-        "documents":         len(documents),
-        "chunks":            len(chunks),
-        "chunk_size":        chunk_size,
-        "chunk_overlap":     chunk_overlap,
+        "vespa_url": vespa_url,
+        "vespa_port": vespa_port,
+        "schema": "doc",
+        "documents": len(documents),
+        "chunks": fed,
+        "chunk_size": chunk_size,
+        "chunk_overlap": chunk_overlap,
     }
 
 

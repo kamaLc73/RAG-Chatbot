@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="utf-8" ?>
+<services version="1.0" xmlns:deploy="vespa" xmlns:preprocess="properties">
+
+  <container id="default" version="1.0">
+    <document-api/>
+    <search/>
+    <nodes>
+      <node hostalias="node1"/>
+    </nodes>
+  </container>
+
+  <content id="rcar_cnra" version="1.0">
+    <redundancy>1</redundancy>
+    <documents>
+      <document type="doc" mode="index"/>
+      <document type="video" mode="index"/>
+      <document type="form" mode="index"/>
+    </documents>
+    <nodes>
+      <node hostalias="node1" distribution-key="0"/>
+    </nodes>
+  </content>
+
+</services>

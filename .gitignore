@@ -9,4 +9,5 @@ Tesseract-OCR/
 docs/
 *.ipynb
 CLAUDE.md
+agent.md
 test/

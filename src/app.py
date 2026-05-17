@@ -467,34 +467,6 @@ def render_plain_text(text: str) -> str:
     # Sauts de ligne
     text = text.replace("\n", "<br>")
     return text
-
-
-def render_video_cards(videos: list[dict]) -> str:
-    if not videos:
-        return ""
-    cards = '<div class="video-suggestions">'
-    cards += '<div class="video-suggestions-label">▶ Vidéos suggérées</div>'
-    for v in videos:
-        title     = html.escape(v.get("title", "Vidéo CNRA/RCAR"))
-        url       = html.escape(v.get("url", "#"))
-        thumbnail = html.escape(v.get("thumbnail_url",
-            f"https://img.youtube.com/vi/{v.get('video_id', '')}/mqdefault.jpg"))
-        excerpt = html.escape((v.get("excerpt") or "")[:120])
-        if excerpt:
-            excerpt += "..."
-        cards += f"""
-        <a href="{url}" target="_blank" rel="noopener noreferrer" class="video-card">
-            <img src="{thumbnail}" alt="" loading="lazy" onerror="this.style.display='none'">
-            <div class="video-card-info">
-                <div class="video-card-title">{title}</div>
-                {"<div class='video-card-excerpt'>" + excerpt + "</div>" if excerpt else ""}
-                <div class="video-card-icon">▶ Voir sur YouTube</div>
-            </div>
-        </a>"""
-    cards += "</div>"
-    return cards
-
-
 def render_form_cards(forms: list[dict]) -> str:
     if not forms:
         return ""
@@ -524,6 +496,39 @@ def render_form_cards(forms: list[dict]) -> str:
             f'{actions}'
             f'</div>'
             f'</div>'
+        )
+
+    cards += "</div>"
+    return cards
+
+
+def render_video_cards(videos: list[dict]) -> str:
+    if not videos:
+        return ""
+
+    cards = '<div class="video-suggestions">'
+    cards += '<div class="video-suggestions-label">Videos suggerees</div>'
+
+    for v in videos:
+        title = html.escape(v.get("title", "Video CNRA/RCAR"), quote=True)
+        url = html.escape(v.get("url", "#"), quote=True)
+        video_id = v.get("video_id", "")
+        thumbnail = html.escape(
+            v.get("thumbnail_url") or f"https://img.youtube.com/vi/{video_id}/mqdefault.jpg",
+            quote=True,
+        )
+        excerpt = html.escape((v.get("excerpt") or v.get("description") or "")[:120], quote=True)
+        excerpt_html = f"<div class='video-card-excerpt'>{excerpt}...</div>" if excerpt else ""
+
+        cards += (
+            f'<a href="{url}" target="_blank" rel="noopener noreferrer" class="video-card">'
+            f'<img src="{thumbnail}" alt="" loading="lazy" onerror="this.style.display=\'none\'">'
+            f'<div class="video-card-info">'
+            f'<div class="video-card-title">{title}</div>'
+            f'{excerpt_html}'
+            f'<div class="video-card-icon">Voir sur YouTube</div>'
+            f'</div>'
+            f'</a>'
         )
 
     cards += "</div>"

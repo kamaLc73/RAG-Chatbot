@@ -1,27 +1,3 @@
-"""
-src/chatbot/rag_pipeline.py
-============================
-Pipeline RAG principal + reranking sur chroma_db + suggestions vidéos + formulaires.
-
-Flux de retrieval documentaire :
-    1. similarity_search(k=RAG_RETRIEVE_K)   → 12 candidats vectoriels
-    2. shared_reranker.predict()              → score cross-encoder sur chaque candidat
-    3. tri décroissant → top RAG_FINAL_K=4   → chunks envoyés au LLM
-
-Champs retournés par query() — TOUJOURS présents (succès ET erreur) :
-    {
-        "response":          str,
-        "context_docs":      int,        # nombre de chunks après reranking
-        "videos":            list[dict],
-        "forms":             list[dict],
-        "intent":            str,        # intent classifié (défaut: "retrieval")
-        "intent_confidence": float,      # score cosinus moyen (défaut: 0.0)
-        "original_query":    str,
-        "cached":            bool,
-        "error":             bool,       # présent uniquement si True
-    }
-"""
-# ── Compatibilité Python 3.8+ pour les annotations de type ───────────────────
 from __future__ import annotations
 
 import os
@@ -31,14 +7,12 @@ import time
 import unicodedata
 import warnings
 from collections import OrderedDict
-from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from os import getenv
 
 os.environ["TRANSFORMERS_VERBOSITY"] = "error"
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
-
-warnings.filterwarnings("ignore", message=r"Accessing `__path__` from `\.models\..*",)
+warnings.filterwarnings("ignore", message=r"Accessing `__path__` from `\.models\..*")
 warnings.filterwarnings("ignore", category=FutureWarning)
 
 try:
@@ -46,28 +20,21 @@ try:
 except ImportError:
     torch = None
 
-from chromadb import PersistentClient
 from dotenv import load_dotenv
-from langchain_chroma import Chroma
+from langchain_core.documents import Document
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_ollama import ChatOllama
 from loguru import logger
-from sentence_transformers import CrossEncoder
-
-try:
-    from transformers.utils import logging as transformers_logging
-    transformers_logging.set_verbosity_error()
-except Exception:
-    pass
 
 src_root = Path(__file__).resolve().parents[1]
 if str(src_root) not in sys.path:
     sys.path.insert(0, str(src_root))
 
 from config.logger import setup_logger
-from config.settings import BASE_DIR, LOGS_DIR
+from config.settings import BASE_DIR, LOGS_DIR, VESPA_PORT, VESPA_URL
+from store.vespa_store import count_schema, make_vespa_app, query_schema
 
 try:
     from chatbot.intent_classifier import IntentClassifier
@@ -77,45 +44,38 @@ except ImportError:
     logger.warning("IntentClassifier non disponible.")
 
 try:
-    from chatbot.video_retriever import VideoRetriever
-    _VIDEO_RETRIEVER_AVAILABLE = True
-except ImportError:
-    _VIDEO_RETRIEVER_AVAILABLE = False
-    logger.warning("VideoRetriever non disponible.")
+    from transformers.utils import logging as transformers_logging
 
-try:
-    from chatbot.form_retriever import FormRetriever
-    _FORM_RETRIEVER_AVAILABLE = True
-except ImportError:
-    _FORM_RETRIEVER_AVAILABLE = False
-    logger.warning("FormRetriever non disponible.")
+    transformers_logging.set_verbosity_error()
+except Exception:
+    pass
 
 load_dotenv(BASE_DIR / ".env")
 
-VECTORSTORE_RELATIVE_PATH = Path("data") / "vectorstore" / "chroma_db_unified"
-DEFAULT_EMBEDDING_MODEL   = "BAAI/bge-m3"
-RERANKER_MODEL            = "BAAI/bge-reranker-v2-m3"
+DEFAULT_EMBEDDING_MODEL = "BAAI/bge-m3"
 HF_TOKEN = getenv("HF_TOKEN", "").strip().strip('"\'')
 
-OLLAMA_MODEL       = getenv("OLLAMA_MODEL", "mistral:latest").strip().strip('"\'')
-OLLAMA_BASE_URL    = getenv("OLLAMA_BASE_URL", "http://localhost:11434")
-OLLAMA_API_KEY     = getenv("OLLAMA_API_KEY", "").strip().strip('"\'')
+OLLAMA_MODEL = getenv("OLLAMA_MODEL", "mistral:latest").strip().strip('"\'')
+OLLAMA_BASE_URL = getenv("OLLAMA_BASE_URL", "http://localhost:11434")
+OLLAMA_API_KEY = getenv("OLLAMA_API_KEY", "").strip().strip('"\'')
 OLLAMA_TEMPERATURE = 0.1
 OLLAMA_NUM_PREDICT = 1200
-OLLAMA_NUM_CTX     = 4096
-OLLAMA_KEEP_ALIVE  = "30m"
+OLLAMA_NUM_CTX = 4096
+OLLAMA_KEEP_ALIVE = "30m"
 
-# ── Paramètres retrieval principal ────────────────────────────────────────────
-# RAG_RETRIEVE_K : candidats récupérés par similarity_search (pool pour le reranker)
-# RAG_FINAL_K    : chunks conservés après reranking → envoyés au LLM
-# Règle : RAG_RETRIEVE_K >= RAG_FINAL_K (typiquement 3x)
-RAG_RETRIEVE_K        = 12    # Pool élargi pour donner du choix au reranker
-RAG_FINAL_K           = 4     # Chunks finaux après reranking
+RAG_RETRIEVE_K = 12
+RAG_FINAL_K = 4
 RAG_MAX_CONTEXT_CHARS = 4000
-RAG_MAX_DOC_CHARS     = 1000
-RAG_CACHE_SIZE        = 100
+RAG_MAX_DOC_CHARS = 1000
+RAG_CACHE_SIZE = 100
 
-# ── Mots-cles off-scope par organisme (texte normalise ASCII) ───────────────
+VIDEO_RETRIEVE_K = 10
+VIDEO_FINAL_K = 2
+FORM_RETRIEVE_K = 10
+FORM_FINAL_K = 1
+VIDEO_RELEVANCE_THRESHOLD = 0.185
+FORM_RELEVANCE_THRESHOLD = 0.220
+
 CNRA_KEYWORDS = {
     "cnra",
     "recore",
@@ -156,32 +116,30 @@ class RAGPipeline:
     def __init__(
         self,
         local_model: str = OLLAMA_MODEL,
-        vectorstore_path: Path | str = VECTORSTORE_RELATIVE_PATH,
-        collection_name: str = "rcar_cnra_unified",
+        vespa_url: str = VESPA_URL,
+        vespa_port: int = VESPA_PORT,
         embedding_model: str = DEFAULT_EMBEDDING_MODEL,
         enable_video_suggestions: bool = True,
-        enable_form_suggestions:  bool = True,
+        enable_form_suggestions: bool = True,
     ):
-        resolved_path = Path(vectorstore_path)
-        if not resolved_path.is_absolute():
-            resolved_path = (BASE_DIR / resolved_path).resolve()
-
-        self.collection_name   = collection_name
-        self.retrieval_k       = RAG_RETRIEVE_K
-        self.final_k           = RAG_FINAL_K
+        self.vespa_url = vespa_url
+        self.vespa_port = vespa_port
+        self.vespa = make_vespa_app(vespa_url, vespa_port)
+        self.enable_video_suggestions = enable_video_suggestions
+        self.enable_form_suggestions = enable_form_suggestions
+        self.retrieval_k = RAG_RETRIEVE_K
+        self.final_k = RAG_FINAL_K
         self.max_context_chars = RAG_MAX_CONTEXT_CHARS
-        self.max_doc_chars     = RAG_MAX_DOC_CHARS
+        self.max_doc_chars = RAG_MAX_DOC_CHARS
         self.response_cache: OrderedDict = OrderedDict()
 
-        logger.info("VectorStore: {} (collection={})", resolved_path, collection_name)
+        logger.info("Vespa: {}:{}", vespa_url, vespa_port)
 
-        # ── Device ────────────────────────────────────────────────────────────
         try:
             device = "cuda" if (torch and torch.cuda.is_available()) else "cpu"
         except Exception:
             device = "cpu"
 
-        # ── Embeddings (instance unique partagée) ─────────────────────────────
         logger.info("Embedding: {} sur {}", embedding_model, device)
         model_kwargs: dict = {"device": device}
         if HF_TOKEN:
@@ -193,95 +151,35 @@ class RAGPipeline:
             encode_kwargs={"normalize_embeddings": True, "batch_size": 32},
         )
 
-        # FP16 sur GPU : −50% VRAM, ~+20% throughput
         try:
             if device == "cuda" and hasattr(self.embeddings, "client"):
                 if hasattr(self.embeddings.client, "model"):
                     self.embeddings.client.model.half()
-                    logger.info("Embeddings castées en FP16 (GPU)")
+                    logger.info("Embeddings castees en FP16 (GPU)")
         except Exception as exc:
-            logger.debug("Embeddings FP16 cast échoué (fallback FP32): {}", exc)
+            logger.debug("Embeddings FP16 cast echoue (fallback FP32): {}", exc)
 
         self._warm_up_embeddings()
 
-        # ── Intent Classifier (réutilise les embeddings partagés) ─────────────
         self.intent_classifier: IntentClassifier | None = None
         if _INTENT_CLASSIFIER_AVAILABLE:
             try:
-                self.intent_classifier = IntentClassifier(
-                    shared_embeddings=self.embeddings,
-                )
+                self.intent_classifier = IntentClassifier(shared_embeddings=self.embeddings)
                 stats = self.intent_classifier.get_stats()
                 logger.info(
-                    "IntentClassifier prêt: {} intents, {} exemples",
-                    stats.get("total_intents", 0), stats.get("total_examples", 0)
+                    "IntentClassifier pret: {} intents, {} exemples",
+                    stats.get("total_intents", 0),
+                    stats.get("total_examples", 0),
                 )
             except Exception as exc:
-                logger.warning("IntentClassifier init échoué: {} — gate désactivé", exc)
+                logger.warning("IntentClassifier init echoue: {} - gate desactive", exc)
 
-        # ── Reranker (instance unique partagée) ───────────────────────────────
-        self.shared_reranker: CrossEncoder | None = None
-        try:
-            self.shared_reranker = CrossEncoder(
-                RERANKER_MODEL,
-                max_length=512,
-                device=device,
-            )
-            if device == "cuda" and self.shared_reranker.model is not None:
-                try:
-                    self.shared_reranker.model.half()
-                    logger.info("Reranker casté en FP16 (GPU)")
-                except Exception as exc:
-                    logger.debug("Reranker FP16 cast échoué: {}", exc)
-            logger.info("Reranker chargé: {} sur {}", RERANKER_MODEL, device)
-        except Exception as exc:
-            logger.warning("Reranker non disponible ({}), fallback scores vectoriels", exc)
-
-        # ── VectorStore principal ─────────────────────────────────────────────
-        self.vectorstore = Chroma(
-            persist_directory=str(resolved_path),
-            embedding_function=self.embeddings,
-            collection_name=collection_name,
-        )
-        self.collection_count = self._get_collection_count(resolved_path, collection_name)
-        logger.info("Collection '{}': {} chunks", collection_name, self.collection_count)
+        self.collection_count = self._get_doc_count()
+        logger.info("Vespa schema doc: {} chunks", self.collection_count)
         if self.collection_count == 0:
-            logger.warning("Collection vide — lancez index_data.py pour l'indexation.")
+            logger.warning("Schema doc vide ou Vespa indisponible - lancez index_data.py apres deploy Vespa.")
 
-        # ── VideoRetriever (instance partagée) ────────────────────────────────
-        self.video_retriever = None
-        if enable_video_suggestions and _VIDEO_RETRIEVER_AVAILABLE:
-            try:
-                self.video_retriever = VideoRetriever(
-                    shared_embeddings=self.embeddings,
-                    shared_reranker=self.shared_reranker,
-                )
-                logger.info(
-                    "Suggestions vidéo : {}",
-                    "activées" if self.video_retriever.available else "désactivées (lance index_videos.py)",
-                )
-            except Exception as exc:
-                logger.warning("VideoRetriever init échoué: {}", exc)
-
-        # ── FormRetriever (instance partagée) ─────────────────────────────────
-        self.form_retriever = None
-        if enable_form_suggestions and _FORM_RETRIEVER_AVAILABLE:
-            try:
-                self.form_retriever = FormRetriever(
-                    shared_embeddings=self.embeddings,
-                    shared_reranker=self.shared_reranker,
-                )
-                logger.info(
-                    "Suggestions formulaires : {}",
-                    "activées" if self.form_retriever.available else "désactivées (lance index_forms.py)",
-                )
-            except Exception as exc:
-                logger.warning("FormRetriever init échoué: {}", exc)
-
-        # ── LLM ───────────────────────────────────────────────────────────────
-        client_kwargs = (
-            {"headers": {"Authorization": f"Bearer {OLLAMA_API_KEY}"}} if OLLAMA_API_KEY else None
-        )
+        client_kwargs = {"headers": {"Authorization": f"Bearer {OLLAMA_API_KEY}"}} if OLLAMA_API_KEY else None
         llm_kwargs = dict(
             model=local_model,
             base_url=OLLAMA_BASE_URL,
@@ -294,7 +192,7 @@ class RAGPipeline:
             llm_kwargs["client_kwargs"] = client_kwargs
 
         logger.info("LLM: {} @ {}", local_model, OLLAMA_BASE_URL)
-        self.llm    = ChatOllama(**llm_kwargs)
+        self.llm = ChatOllama(**llm_kwargs)
         self.parser = StrOutputParser()
         self.prompt = ChatPromptTemplate.from_messages([
             ("system", self._system_prompt()),
@@ -302,12 +200,11 @@ class RAGPipeline:
         ])
         self.chain = self.prompt | self.llm | self.parser
 
-    # ── Helpers privés ────────────────────────────────────────────────────────
-
-    def _get_collection_count(self, path: Path, collection_name: str) -> int:
+    def _get_doc_count(self) -> int:
         try:
-            return PersistentClient(path=str(path)).get_collection(collection_name).count()
-        except Exception:
+            return count_schema(self.vespa, "doc")
+        except Exception as exc:
+            logger.warning("Impossible de compter les documents Vespa: {}", exc)
             return 0
 
     def _error_response(
@@ -321,110 +218,68 @@ class RAGPipeline:
         intent_confidence: float = 0.0,
         context_docs: int = 0,
     ) -> dict:
-        """
-        Construit un payload d'erreur uniforme, avec TOUTES les clés du
-        payload nominal. Évite les KeyError côté appelant si l'accès se
-        fait sans .get().
-        """
         return {
-            "response":          message,
-            "error":             True,
-            "context_docs":      context_docs,
-            "videos":            videos or [],
-            "forms":             forms or [],
-            "intent":            intent,
+            "response": message,
+            "error": True,
+            "context_docs": context_docs,
+            "videos": videos or [],
+            "forms": forms or [],
+            "intent": intent,
             "intent_confidence": intent_confidence,
-            "original_query":    original_query,
-            "cached":            False,
+            "original_query": original_query,
+            "cached": False,
         }
 
     def _build_org_identity(self, org: str) -> str:
-        """
-        Génère le bloc d'identité org-spécifique pour le prompt système.
-        Injecte clairement au LLM son rôle et ses limites selon l'org actif.
-        """
         if org == "cnra":
             return (
                 "VOTRE IDENTITE ET SCOPE:\n"
-                "Vous etes l'assistant officiel de la CNRA (Caisse Nationale de Retraites et d'Assurances).\n"
-                "DEFINITION CNRA:\n"
-                "- Etablissement public gerant les rentes d'accidents du travail et de circulation,\n"
-                "  les rentes viageres et les produits d'assurance-vie au Maroc (branche CDG).\n"
-                "\n"
-                "Vous repondez UNIQUEMENT sur les sujets CNRA :\n"
-                "  - Rentes d'accidents du travail et de circulation\n"
-                "  - Rentes viageres et produits d'assurance-vie\n"
-                "  - Procedures et demarches CNRA\n"
-                "\n"
-                "RESTRICTIONS STRICTES :\n"
-                "- Vous n'etes PAS l'assistant du RCAR.\n"
-                "- Si l'utilisateur pose une question EXCLUSIVEMENT sur le RCAR (retraite complementaire agents non titulaires),\n"
-                "  repondez : 'Cette question concerne le RCAR, pas la CNRA. Je suis l'assistant CNRA uniquement.\n"
-                "  Consultez le site rcar.ma ou l'assistant RCAR pour cette demande.'\n"
-                "- N'ajoutez AUCUNE information sur le RCAR dans votre reponse."
+                "Vous etes l'assistant officiel de la CNRA.\n"
+                "Vous repondez uniquement sur les sujets CNRA: rentes d'accidents du travail et de circulation, "
+                "rentes viageres, assurance-vie, procedures et demarches CNRA.\n"
+                "Si la question concerne exclusivement le RCAR, dites que cette question concerne le RCAR, pas la CNRA."
             )
-        elif org == "rcar":
+        if org == "rcar":
             return (
                 "VOTRE IDENTITE ET SCOPE:\n"
-                "Vous etes l'assistant officiel du RCAR (Regime Collectif d'Allocation de Retraite).\n"
-                "DEFINITION RCAR:\n"
-                "- Regime de retraite complementaire destine aux agents non titulaires de l'Etat,\n"
-                "  des collectivites locales et au personnel des etablissements publics.\n"
-                "\n"
-                "Vous repondez UNIQUEMENT sur les sujets RCAR :\n"
-                "  - Retraite complementaire pour agents non titulaires\n"
-                "  - Regimes general et complementaire du RCAR\n"
-                "  - Demarches d'affiliation et de retraite\n"
-                "  - Procedures administratives RCAR\n"
-                "\n"
-                "RESTRICTIONS STRICTES :\n"
-                "- Vous n'etes PAS l'assistant de la CNRA.\n"
-                "- Si l'utilisateur pose une question EXCLUSIVEMENT sur la CNRA (rentes AT/circulation, assurance-vie),\n"
-                "  repondez : 'Cette question concerne la CNRA, pas le RCAR. Je suis l'assistant RCAR uniquement.\n"
-                "  Consultez le site cnra.ma ou l'assistant CNRA pour cette demande.'\n"
-                "- N'ajoutez AUCUNE information sur la CNRA dans votre reponse."
+                "Vous etes l'assistant officiel du RCAR.\n"
+                "Vous repondez uniquement sur les sujets RCAR: retraite complementaire, regimes general et complementaire, "
+                "affiliation, cotisation, pension et procedures RCAR.\n"
+                "Si la question concerne exclusivement la CNRA, dites que cette question concerne la CNRA, pas le RCAR."
             )
-        else:  # org == "all"
-            return (
-                "VOTRE IDENTITE ET SCOPE:\n"
-                "Vous etes l'assistant conjoint officiel du RCAR et de la CNRA.\n"
-                "DEFINITIONS:\n"
-                "- RCAR (Regime Collectif d'Allocation de Retraite) : retraite complementaire pour\n"
-                "  agents non titulaires de l'Etat et des collectivites locales.\n"
-                "- CNRA (Caisse Nationale de Retraites et d'Assurances) : rentes AT/circulation,\n"
-                "  rentes viageres, assurance-vie (branche CDG).\n"
-                "\n"
-                "DISTINCTIONS IMPORTANTES :\n"
-                "- Precisez toujours quel organisme concerne la reponse.\n"
-                "- Si une question concerne UN SEUL organisme, mentionnez-le clairement.\n"
-                "- Si une question concerne les DEUX, clarifiez les roles de chacun."
-            )
+        return (
+            "VOTRE IDENTITE ET SCOPE:\n"
+            "Vous etes l'assistant conjoint officiel du RCAR et de la CNRA.\n"
+            "Distinguez toujours les informations qui concernent le RCAR de celles qui concernent la CNRA."
+        )
 
     def _system_prompt(self) -> str:
         return """Vous etes un assistant virtuel officiel.
 
-    {org_identity}
+{org_identity}
 
-    REGLES STRICTES:
-    - Repondez uniquement en francais.
-    - Basez-vous EXCLUSIVEMENT sur le contexte fourni ci-dessous. N'inventez, n'interpolez ou ne supposez aucune information absente du contexte.
-    - Si le contexte ne contient pas la reponse, dites clairement : "Je ne dispose pas de cette information dans ma base documentaire. Consultez directement rcar.ma ou cnra.ma, ou contactez leurs services."
-    - Ne donnez jamais de conseils juridiques, fiscaux ou financiers personnalises.
-    - Soyez precis sur les organismes : distinguez toujours ce qui concerne le RCAR de ce qui concerne la CNRA.
+REGLES STRICTES:
+- Repondez uniquement en francais.
+- Basez-vous EXCLUSIVEMENT sur le CONTEXTE DOCUMENTAIRE ci-dessous pour repondre au fond de la question. N'inventez, n'interpolez ou ne supposez aucune information absente du contexte.
+- Si le contexte ne contient pas la reponse, dites clairement : "Je ne dispose pas de cette information dans ma base documentaire. Consultez directement rcar.ma ou cnra.ma, ou contactez leurs services."
+- Ne donnez jamais de conseils juridiques, fiscaux ou financiers personnalises.
+- Soyez precis sur les organismes : distinguez toujours ce qui concerne le RCAR de ce qui concerne la CNRA.
+- Les ressources supplementaires ne font PAS partie du contexte documentaire. Ne les utilisez jamais pour justifier ou construire la reponse de fond.
 
-    RESSOURCES SUPPLEMENTAIRES DISPONIBLES:
-    {supplementary_hint}
+RESSOURCES SUPPLEMENTAIRES DISPONIBLES:
+{supplementary_hint}
 
-    FORMAT DE REPONSE:
-    - Texte brut uniquement, sans aucune syntaxe Markdown.
-    - Reponses structurees en phrases courtes et claires.
-    - Pour les listes, commencez chaque element par "- " sur une nouvelle ligne.
-    - Longueur adaptee a la question.
-    - Si des videos ou formulaires sont disponibles (indiques dans RESSOURCES SUPPLEMENTAIRES), mentionnez-les brievement a la fin de votre reponse.
-    - Si AUCUNE ressource n'est disponible, ne mentionnez PAS les videos ou formulaires. Ne dites JAMAIS \"aucune video\", \"aucun formulaire\" ou toute phrase similaire indiquant leur absence.
+FORMAT DE REPONSE:
+- Texte brut uniquement, sans aucune syntaxe Markdown.
+- Reponses structurees en phrases courtes et claires.
+- Pour les listes, commencez chaque element par "- " sur une nouvelle ligne.
+- Longueur adaptee a la question.
+- Si des ressources supplementaires sont disponibles, ajoutez uniquement a la fin : "Des ressources complementaires sont affichees ci-dessous."
+- Ne citez jamais les titres des videos ou formulaires dans votre reponse. Ils sont deja affiches separement dans l'interface.
+- Si aucune ressource supplementaire n'est disponible, ne mentionnez pas les videos ou formulaires.
 
-    CONTEXTE DOCUMENTAIRE:
-    {context}"""
+CONTEXTE DOCUMENTAIRE:
+{context}"""
 
     def _warm_up_embeddings(self) -> None:
         try:
@@ -432,7 +287,7 @@ class RAGPipeline:
             self.embeddings.embed_query("verification initiale")
             logger.info("Warmup embeddings: {:.3f}s", time.perf_counter() - t)
         except Exception as exc:
-            logger.warning("Warmup ignoré: {}", exc)
+            logger.warning("Warmup ignore: {}", exc)
 
     def _normalize_text(self, text: str) -> str:
         normalized = unicodedata.normalize("NFKD", text or "")
@@ -441,22 +296,10 @@ class RAGPipeline:
         normalized = re.sub(r"[^a-z0-9]+", " ", normalized)
         return f" {normalized.strip()} "
 
-    def _contains_any_keyword(self, normalized_text: str, keywords: set[str]) -> bool:
-        return any(f" {kw} " in normalized_text for kw in keywords)
-
     def _detect_offscope_org(self, query: str, org: str) -> str:
-        """
-        Detecte si la question concerne exclusivement l'autre organisme.
-        Retourne "cnra", "rcar" ou "" si rien de detecte.
-
-        Version conservative : ne bloque que si le mot-cle est present ET
-        suffisamment discriminant (longueur > 4 chars pour eviter les faux positifs).
-        """
         if org == "all":
             return ""
         normalized = self._normalize_text(query)
-
-        # Seuil : ignorer les keywords trop courts (risque de faux positifs)
         min_keyword_len = 5
 
         if org == "rcar":
@@ -483,57 +326,33 @@ class RAGPipeline:
             )
 
         return {
-            "response":          message,
-            "context_docs":      0,
-            "videos":            [],
-            "forms":             [],
-            "intent":            "out_of_scope",
+            "response": message,
+            "context_docs": 0,
+            "videos": [],
+            "forms": [],
+            "intent": "out_of_scope",
             "intent_confidence": 1.0,
-            "original_query":    original_query,
-            "cached":            False,
-            "org":               org,
-        }
-
-    def _build_org_filter(self, org: str, doc_type: str) -> dict:
-        """
-        Construit le filtre ChromaDB WHERE selon l'organisme actif.
-        
-        - org="all"  → filtre sur type uniquement
-        - org="cnra" | "rcar" → filtre $and type + org (inclut 'both')
-        """
-        if org == "all":
-            return {"type": {"$eq": doc_type}}
-        return {
-            "$and": [
-                {"type": {"$eq": doc_type}},
-                {"org":  {"$in": [org, "both"]}},
-            ]
+            "original_query": original_query,
+            "cached": False,
+            "org": org,
         }
 
     def _build_supplementary_hint(self, videos: list, forms: list) -> str:
-        """
-        Informe le LLM des ressources disponibles (vidéos et formulaires).
-        Évite que le LLM réponde "je n'ai pas de vidéo/formulaire" alors
-        qu'ils sont affichés dans l'interface.
-        """
-        parts = []
+        kinds = []
         if videos:
-            titles = ", ".join(f'"{v.get("title", "vidéo")}"' for v in videos[:2])
-            parts.append(
-                f"Des videos YouTube pertinentes sont disponibles pour cette question "
-                f"({titles}). Elles seront affichees a l'utilisateur."
-            )
+            kinds.append("videos")
         if forms:
-            titles = ", ".join(f'"{f.get("title", "formulaire")}"' for f in forms[:2])
-            parts.append(
-                f"Des formulaires PDF sont disponibles ({titles}). Ils seront affiches "
-                f"a l'utilisateur avec un lien de telechargement."
-            )
-        if not parts:
+            kinds.append("formulaires")
+        if not kinds:
             return "Aucune ressource supplementaire disponible. Ne mentionnez PAS les videos ou formulaires dans votre reponse."
-        return " ".join(parts)
+        return (
+            "Des ressources supplementaires sont disponibles dans l'interface: "
+            + ", ".join(kinds)
+            + ". Ne citez pas leurs titres et ne les utilisez pas comme contexte documentaire. "
+            "Ajoutez seulement la phrase finale autorisee si cela reste naturel."
+        )
 
-    def _build_context(self, docs: list) -> str:
+    def _build_context(self, docs: list[Document]) -> str:
         parts, total = [], 0
         for doc in docs:
             chunk = (doc.page_content or "")[: self.max_doc_chars]
@@ -555,200 +374,325 @@ class RAGPipeline:
         while len(self.response_cache) > RAG_CACHE_SIZE:
             self.response_cache.popitem(last=False)
 
-    def _retrieve_and_rerank_docs(self, query: str, org: str = "all") -> list:
-        """
-        Recherche vectorielle sur chroma_db + reranking cross-encoder.
-
-        Étapes :
-          1. similarity_search(k=RAG_RETRIEVE_K)  → pool de candidats (défaut 12)
-          2. shared_reranker.predict()             → score pertinence de chaque chunk
-          3. tri + top RAG_FINAL_K                 → chunks finaux (défaut 4)
-
-        Si le reranker est indisponible, retourne les RAG_FINAL_K premiers
-        résultats vectoriels (comportement identique à avant).
-        """
-        # Étape 1 — pool vectoriel élargi, filtré sur type=doc + org
-        candidates = self.vectorstore.similarity_search(
-            query,
-            k=self.retrieval_k,
-            filter=self._build_org_filter(org, "doc"),
+    def _retrieve_docs_vespa(self, query: str, query_embedding: list[float], org: str = "all") -> list[Document]:
+        hits = query_schema(
+            self.vespa,
+            schema="doc",
+            query_text=query,
+            query_embedding=query_embedding,
+            org=org,
+            target_hits=self.retrieval_k,
+            hits=self.final_k,
         )
+        docs = []
+        for hit in hits:
+            fields = hit.fields
+            docs.append(
+                Document(
+                    page_content=fields.get("text", ""),
+                    metadata={
+                        "doc_id": fields.get("doc_id", ""),
+                        "org": fields.get("org", ""),
+                        "source_type": fields.get("source_type", ""),
+                        "faq_scope": fields.get("faq_scope", ""),
+                        "relative_source": fields.get("relative_source", ""),
+                        "chunk_index": fields.get("chunk_index", 0),
+                        "vespa_relevance": hit.relevance,
+                    },
+                )
+            )
+        return docs
 
-        if not candidates:
+    def _retrieve_videos(self, query: str, query_embedding: list[float], org: str = "all") -> list[dict]:
+        if not self.enable_video_suggestions:
+            return []
+        try:
+            hits = query_schema(
+                self.vespa,
+                schema="video",
+                query_text=query,
+                query_embedding=query_embedding,
+                org=org,
+                target_hits=VIDEO_RETRIEVE_K,
+                hits=VIDEO_RETRIEVE_K,
+            )
+            hits = [h for h in hits if h.relevance >= VIDEO_RELEVANCE_THRESHOLD][:VIDEO_FINAL_K]
+            return [
+                {
+                    "video_id": h.fields.get("video_id", ""),
+                    "title": h.fields.get("title", ""),
+                    "url": h.fields.get("url", ""),
+                    "thumbnail_url": h.fields.get("thumbnail_url", ""),
+                    "upload_date": h.fields.get("upload_date", ""),
+                    "org": h.fields.get("org", ""),
+                    "score": h.relevance,
+                }
+                for h in hits
+            ]
+        except Exception as exc:
+            logger.warning("Erreur recherche video Vespa: {}", exc)
             return []
 
-        # Étape 2 — reranking (si disponible)
-        if self.shared_reranker is not None:
-            pairs = [(query, doc.page_content[:600]) for doc in candidates]
+    def _retrieve_forms(self, query: str, query_embedding: list[float], org: str = "all") -> list[dict]:
+        if not self.enable_form_suggestions:
+            return []
+        try:
+            hits = query_schema(
+                self.vespa,
+                schema="form",
+                query_text=query,
+                query_embedding=query_embedding,
+                org=org,
+                target_hits=FORM_RETRIEVE_K,
+                hits=FORM_RETRIEVE_K,
+            )
+            hits = [h for h in hits if h.relevance >= FORM_RELEVANCE_THRESHOLD][:FORM_FINAL_K]
+            return [
+                {
+                    "form_id": h.fields.get("form_id", ""),
+                    "title": h.fields.get("title", ""),
+                    "category": h.fields.get("category", ""),
+                    "pdf_url": h.fields.get("pdf_url", ""),
+                    "page_url": h.fields.get("page_url", ""),
+                    "org": h.fields.get("org", ""),
+                    "score": h.relevance,
+                }
+                for h in hits
+            ]
+        except Exception as exc:
+            logger.warning("Erreur recherche formulaires Vespa: {}", exc)
+            return []
+
+    def _is_resource_only_query(self, query: str, resource: str) -> bool:
+        normalized = self._normalize_text(query)
+        words = normalized.strip().split()
+        if len(words) > 8:
+            return False
+        if resource == "video":
+            return any(token in normalized for token in (" video ", " videos ", " youtube "))
+        if resource == "form":
+            return any(token in normalized for token in (" formulaire ", " formulaires ", " imprimes ", " imprime "))
+        return False
+
+    def _classify_intent(self, query: str) -> dict:
+        classification = {
+            "intent": "retrieval",
+            "confidence": 0.0,
+            "tier": 1,
+            "reasoning": "IntentClassifier unavailable",
+            "loaded": False,
+        }
+
+        if self.intent_classifier and self.intent_classifier.is_loaded:
             try:
-                scores = self.shared_reranker.predict(pairs).tolist()
-
-                logger.debug("── Reranking chroma_db ({} candidats) ──", len(candidates))
-                ranked = sorted(
-                    zip(scores, candidates),
-                    key=lambda x: x[0],
-                    reverse=True,
-                )
-                for i, (sc, doc) in enumerate(ranked):
-                    src = doc.metadata.get("relative_source", doc.metadata.get("source", "?"))
-                    logger.debug(
-                        "  [{}/{}] score={:.4f} | {}",
-                        i + 1, len(ranked), sc,
-                        src.split("/")[-1][:60] if src else "?"
-                    )
-
-                # Étape 3 — top-K après reranking
-                top_docs = [doc for _, doc in ranked[: self.final_k]]
+                classification = self.intent_classifier.classify(query)
                 logger.info(
-                    "Reranking docs: {} candidats → {} retenus (meilleur score: {:.4f})",
-                    len(candidates), len(top_docs), ranked[0][0] if ranked else 0,
+                    "Intent: {} [tier {}] conf={:.3f}",
+                    classification.get("intent", "retrieval"),
+                    classification.get("tier", 1),
+                    classification.get("confidence", 0.0),
                 )
-                return top_docs
-
             except Exception as exc:
-                logger.warning("Reranker erreur sur chroma_db ({}), fallback vectoriel", exc)
+                logger.warning("Intent classification echouee: {} - fallback retrieval", exc)
 
-        # Fallback : pas de reranker → top RAG_FINAL_K résultats vectoriels
-        return candidates[: self.final_k]
+        return classification
 
-    def _retrieve_videos(self, query: str, org: str = "all") -> list[dict]:
-        if not self.video_retriever or not self.video_retriever.available:
-            return []
-        try:
-            return self.video_retriever.retrieve(query, org=org)
-        except Exception as exc:
-            logger.warning("Erreur recherche vidéo: {}", exc)
-            return []
+    def _simple_payload(
+        self,
+        response: str,
+        query: str,
+        org: str,
+        classification: dict,
+        intent: str | None = None,
+    ) -> dict:
+        return {
+            "response": response,
+            "context_docs": 0,
+            "videos": [],
+            "forms": [],
+            "intent": intent or classification.get("intent", "retrieval"),
+            "intent_confidence": classification.get("confidence", 0.0),
+            "original_query": query,
+            "cached": False,
+            "org": org,
+        }
 
-    def _retrieve_forms(self, query: str, org: str = "all") -> list[dict]:
-        if not self.form_retriever or not self.form_retriever.available:
-            return []
-        try:
-            return self.form_retriever.retrieve(query, org=org)
-        except Exception as exc:
-            logger.warning("Erreur recherche formulaires: {}", exc)
-            return []
+    def _greeting_response(self, org: str) -> str:
+        if org == "rcar":
+            return "Bonjour. Je suis l'assistant RCAR. Posez-moi une question sur le RCAR ou ses procedures."
+        if org == "cnra":
+            return "Bonjour. Je suis l'assistant CNRA. Posez-moi une question sur la CNRA ou ses procedures."
+        return "Bonjour. Je peux vous aider sur les informations RCAR et CNRA disponibles dans la base documentaire."
 
-    # ── API publique ──────────────────────────────────────────────────────────
+    def _should_short_circuit_out_of_scope(self, query: str, classification: dict) -> bool:
+        intent = classification.get("intent", "retrieval")
+        if intent == "out_of_scope":
+            return True
+
+        confidence = float(classification.get("confidence", 0.0) or 0.0)
+        reasoning = str(classification.get("reasoning", "")).lower()
+        if intent == "retrieval" and confidence < 0.60 and "out_of_scope" in reasoning:
+            return True
+
+        normalized = self._normalize_text(query)
+        obvious_outside_terms = (
+            " restaurant ",
+            " hotel ",
+            " meteo ",
+            " football ",
+            " match ",
+            " recette ",
+            " cuisine ",
+            " voyage ",
+            " billet avion ",
+            " film ",
+            " musique ",
+        )
+        return any(term in normalized for term in obvious_outside_terms)
+
+    def _should_run_auxiliary_retriever(self, classification: dict, kind: str, query: str) -> bool:
+        if self.intent_classifier is None or not self.intent_classifier.is_loaded:
+            return True
+
+        confidence = float(classification.get("confidence", 0.0) or 0.0)
+        threshold = getattr(self.intent_classifier, "gate_confidence_threshold", 0.60)
+        if classification.get("intent") == "retrieval" and confidence < threshold:
+            return self._is_resource_only_query(query, kind)
+
+        if kind == "video":
+            return self.intent_classifier.should_retrieve_videos(classification)
+        if kind == "form":
+            return self.intent_classifier.should_retrieve_forms(classification)
+        return False
 
     def query(self, query: str, org: str = "all") -> dict:
-        """
-        Traite une question utilisateur avec filtrage par organisme.
-
-        Retourne TOUJOURS un dict avec les clés :
-            response, context_docs, videos, forms, intent, intent_confidence,
-            original_query, org, cached.
-        La valeur intent peut etre "out_of_scope" en cas de blocage.
-        La clé "error": True est ajoutée en cas d'échec.
-        """
         cleaned = (query or "").strip()
         if not cleaned:
-            return self._error_response(
-                "Veuillez saisir une question.",
-                query,
-            )
+            return self._error_response("Veuillez saisir une question.", query)
 
-        # ── Off-scope guard (evite reponses CNRA/RCAR dans le mauvais mode) ──
         offscope = self._detect_offscope_org(cleaned, org)
         if offscope:
             logger.info("Off-scope detecte (org={}, cible={})", org, offscope)
             return self._offscope_response(org, offscope, query)
 
-        # ── Cache ─────────────────────────────────────────────────────────────
-        # Clé de cache incluant l'org (évite les collisions inter-orgs)
         cache_key = f"{org}:{cleaned.lower()}"
-        # Renommé 'hit' pour éviter la collision de nom avec la clé "cached"
-        # du payload retourné dans le dict déballé juste après.
         if hit := self._cache_get(cache_key):
             return {**hit, "original_query": query, "cached": True}
 
+        classification = self._classify_intent(cleaned)
+        intent = classification.get("intent", "retrieval")
+
+        if intent == "greeting":
+            payload = self._simple_payload(self._greeting_response(org), query, org, classification)
+            self._cache_set(cache_key, {k: v for k, v in payload.items() if k not in {"original_query", "cached"}})
+            return payload
+
+        if intent == "prompt_injection":
+            payload = self._simple_payload(
+                "Je ne peux pas suivre cette demande. Je peux uniquement aider avec des informations officielles RCAR/CNRA a partir de la base documentaire.",
+                query,
+                org,
+                classification,
+            )
+            self._cache_set(cache_key, {k: v for k, v in payload.items() if k not in {"original_query", "cached"}})
+            return payload
+
+        if self._should_short_circuit_out_of_scope(cleaned, classification):
+            payload = self._simple_payload(
+                "Cette question ne concerne pas le RCAR ou la CNRA. Je peux uniquement repondre aux questions liees a ces organismes et a leurs procedures.",
+                query,
+                org,
+                classification,
+                intent="out_of_scope",
+            )
+            self._cache_set(cache_key, {k: v for k, v in payload.items() if k not in {"original_query", "cached"}})
+            return payload
+
         if self.collection_count == 0:
             return self._error_response(
-                "Base vectorielle vide — lancez index_data.py puis réessayez.",
+                "Base Vespa vide ou indisponible - lancez Vespa, deployez l'application, puis index_data.py.",
                 query,
             )
 
-        # ── Retrieval + reranking documentaire ───────────────────────────────
         t0 = time.perf_counter()
         try:
-            docs    = self._retrieve_and_rerank_docs(cleaned, org=org)
+            query_embedding = self.embeddings.embed_query(cleaned)
+            docs = self._retrieve_docs_vespa(cleaned, query_embedding, org=org)
             context = self._build_context(docs)
             logger.info(
-                "Retrieval+reranking docs: {} chunks (org={}) en {:.3f}s",
-                len(docs), org, time.perf_counter() - t0,
+                "Retrieval Vespa docs: {} chunks (org={}) en {:.3f}s",
+                len(docs),
+                org,
+                time.perf_counter() - t0,
             )
         except Exception as exc:
-            logger.error("Erreur retrieval: {}", exc)
+            logger.error("Erreur retrieval Vespa: {}", exc)
             return self._error_response("Erreur lors de la recherche.", query)
 
         if not docs:
-            return self._error_response(
-                "Aucun passage pertinent trouvé.",
-                query,
-                context_docs=0,
-            )
+            return self._error_response("Aucun passage pertinent trouve.", query, context_docs=0)
 
-        # ── Intent classification + gate retrievers ───────────────────────────
         videos, forms = [], []
-        classification = {"intent": "retrieval", "confidence": 0.0, "loaded": False}
+        run_videos = self._should_run_auxiliary_retriever(classification, "video", cleaned)
+        run_forms = self._should_run_auxiliary_retriever(classification, "form", cleaned)
 
-        if self.intent_classifier and self.intent_classifier.is_loaded:
-            try:
-                classification = self.intent_classifier.classify(cleaned)
-                logger.info(
-                    "Intent: {} [tier {}] conf={:.3f}",
-                    classification["intent"], classification["tier"], classification["confidence"]
-                )
-            except Exception as exc:
-                logger.warning("Intent classification échouée: {} — gate pass-through", exc)
-
-        run_videos = (
-            self.intent_classifier is None or
-            not self.intent_classifier.is_loaded or
-            self.intent_classifier.should_retrieve_videos(classification)
-        )
-        run_forms = (
-            self.intent_classifier is None or
-            not self.intent_classifier.is_loaded or
-            self.intent_classifier.should_retrieve_forms(classification)
+        t_aux = time.perf_counter()
+        if run_videos:
+            videos = self._retrieve_videos(cleaned, query_embedding, org)
+        if run_forms:
+            forms = self._retrieve_forms(cleaned, query_embedding, org)
+        logger.info(
+            "Retrieval Vespa: videos={} (gate={}) formulaires={} (gate={}) en {:.3f}s",
+            len(videos),
+            "ON" if run_videos else "OFF",
+            len(forms),
+            "ON" if run_forms else "OFF",
+            time.perf_counter() - t_aux,
         )
 
-        t_par = time.perf_counter()
-        try:
-            with ThreadPoolExecutor(max_workers=2) as pool:
-                fut_v = pool.submit(self._retrieve_videos, cleaned, org) if run_videos else None
-                fut_f = pool.submit(self._retrieve_forms, cleaned, org) if run_forms else None
-                videos = fut_v.result(timeout=30) if fut_v else []
-                forms  = fut_f.result(timeout=30) if fut_f else []
-            logger.info(
-                "Retrieval: vidéos={} (gate={}) formulaires={} (gate={}) en {:.3f}s",
-                len(videos), "ON" if run_videos else "OFF",
-                len(forms),  "ON" if run_forms  else "OFF",
-                time.perf_counter() - t_par,
-            )
-        except Exception as exc:
-            logger.warning("Parallel retrieval échoué (fallback séquentiel): {}", exc)
-            if run_videos:
-                videos = self._retrieve_videos(cleaned, org)
-            if run_forms:
-                forms = self._retrieve_forms(cleaned, org)
+        if videos and self._is_resource_only_query(cleaned, "video"):
+            payload = {
+                "response": "Des videos pertinentes sont affichees ci-dessous.",
+                "context_docs": len(docs),
+                "videos": videos,
+                "forms": forms,
+                "intent": classification.get("intent", "needs_video"),
+                "intent_confidence": classification.get("confidence", 0.0),
+                "org": org,
+            }
+            self._cache_set(cache_key, payload)
+            return {**payload, "original_query": query, "cached": False}
 
-        # ── Génération LLM ────────────────────────────────────────────────────
+        if forms and self._is_resource_only_query(cleaned, "form"):
+            payload = {
+                "response": "Les formulaires pertinents sont affiches ci-dessous.",
+                "context_docs": len(docs),
+                "videos": videos,
+                "forms": forms,
+                "intent": classification.get("intent", "needs_form"),
+                "intent_confidence": classification.get("confidence", 0.0),
+                "org": org,
+            }
+            self._cache_set(cache_key, payload)
+            return {**payload, "original_query": query, "cached": False}
+
         t1 = time.perf_counter()
         try:
-            supplementary_hint = self._build_supplementary_hint(videos, forms)
-            org_identity = self._build_org_identity(org)
-            response = str(self.chain.invoke({
-                "context":            context,
-                "question":           cleaned,
-                "supplementary_hint": supplementary_hint,
-                "org_identity":       org_identity,
-            })).strip()
+            response = str(
+                self.chain.invoke(
+                    {
+                        "context": context,
+                        "question": cleaned,
+                        "supplementary_hint": self._build_supplementary_hint(videos, forms),
+                        "org_identity": self._build_org_identity(org),
+                    }
+                )
+            ).strip()
             logger.info("Generation: {:.3f}s | {} chars", time.perf_counter() - t1, len(response))
         except Exception as exc:
-            logger.error("Erreur génération: {}", exc)
+            logger.error("Erreur generation: {}", exc)
             return self._error_response(
-                f"Erreur de génération. Vérifiez qu'Ollama est lancé (ollama pull {OLLAMA_MODEL}).",
+                f"Erreur de generation. Verifiez qu'Ollama est lance (ollama pull {OLLAMA_MODEL}).",
                 query,
                 videos=videos,
                 forms=forms,
@@ -757,15 +701,14 @@ class RAGPipeline:
                 context_docs=len(docs),
             )
 
-        # ── Payload nominal ───────────────────────────────────────────────────
         payload = {
-            "response":          response,
-            "context_docs":      len(docs),
-            "videos":            videos,
-            "forms":             forms,
-            "intent":            classification.get("intent", "retrieval"),
+            "response": response,
+            "context_docs": len(docs),
+            "videos": videos,
+            "forms": forms,
+            "intent": classification.get("intent", "retrieval"),
             "intent_confidence": classification.get("confidence", 0.0),
-            "org":               org,
+            "org": org,
         }
         self._cache_set(cache_key, payload)
         return {**payload, "original_query": query, "cached": False}
