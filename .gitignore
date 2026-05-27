@@ -1,13 +1,10 @@
 .venv/
-env/
+.env
+docs/
 data/
+test/
 logs/
 storage/
 __pycache__/
-Tesseract-OCR/
-.env
-docs/
-*.ipynb
 CLAUDE.md
-agent.md
-test/
+Agents.md

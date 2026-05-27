@@ -28,6 +28,11 @@ from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_ollama import ChatOllama
 from loguru import logger
 
+try:
+    from sentence_transformers import CrossEncoder
+except ImportError:
+    CrossEncoder = None
+
 src_root = Path(__file__).resolve().parents[1]
 if str(src_root) not in sys.path:
     sys.path.insert(0, str(src_root))
@@ -53,6 +58,7 @@ except Exception:
 load_dotenv(BASE_DIR / ".env")
 
 DEFAULT_EMBEDDING_MODEL = "BAAI/bge-m3"
+RERANKER_MODEL = "BAAI/bge-reranker-v2-m3"
 HF_TOKEN = getenv("HF_TOKEN", "").strip().strip('"\'')
 
 OLLAMA_MODEL = getenv("OLLAMA_MODEL", "mistral:latest").strip().strip('"\'')
@@ -68,13 +74,18 @@ RAG_FINAL_K = 4
 RAG_MAX_CONTEXT_CHARS = 4000
 RAG_MAX_DOC_CHARS = 1000
 RAG_CACHE_SIZE = 100
+FAQ_RERANK_BOOST = 0.20
 
 VIDEO_RETRIEVE_K = 10
 VIDEO_FINAL_K = 2
 FORM_RETRIEVE_K = 10
 FORM_FINAL_K = 1
 VIDEO_RELEVANCE_THRESHOLD = 0.185
+VIDEO_RERANK_RELEVANCE_THRESHOLD = 0.0
+VIDEO_RERANK_CONFIDENCE_THRESHOLD = 0.100
+VIDEO_RERANK_MARGIN_THRESHOLD = 0.200
 FORM_RELEVANCE_THRESHOLD = 0.220
+FORM_RERANK_RELEVANCE_THRESHOLD = 0.800
 
 CNRA_KEYWORDS = {
     "cnra",
@@ -121,13 +132,15 @@ class RAGPipeline:
         embedding_model: str = DEFAULT_EMBEDDING_MODEL,
         enable_video_suggestions: bool = True,
         enable_form_suggestions: bool = True,
+        enable_intent_classifier: bool = True,
     ):
         self.vespa_url = vespa_url
         self.vespa_port = vespa_port
         self.vespa = make_vespa_app(vespa_url, vespa_port)
         self.enable_video_suggestions = enable_video_suggestions
         self.enable_form_suggestions = enable_form_suggestions
-        self.retrieval_k = RAG_RETRIEVE_K
+        self.enable_intent_classifier = enable_intent_classifier
+        self.retrieval_k = max(RAG_RETRIEVE_K, RAG_FINAL_K * 6)
         self.final_k = RAG_FINAL_K
         self.max_context_chars = RAG_MAX_CONTEXT_CHARS
         self.max_doc_chars = RAG_MAX_DOC_CHARS
@@ -161,8 +174,27 @@ class RAGPipeline:
 
         self._warm_up_embeddings()
 
+        self.shared_reranker: CrossEncoder | None = None
+        try:
+            if CrossEncoder is None:
+                raise ImportError("sentence_transformers indisponible")
+            self.shared_reranker = CrossEncoder(
+                RERANKER_MODEL,
+                max_length=512,
+                device=device,
+            )
+            if device == "cuda" and self.shared_reranker.model is not None:
+                try:
+                    self.shared_reranker.model.half()
+                    logger.info("Reranker caste en FP16 (GPU)")
+                except Exception as exc:
+                    logger.debug("Reranker FP16 cast echoue: {}", exc)
+            logger.info("Reranker charge: {} sur {}", RERANKER_MODEL, device)
+        except Exception as exc:
+            logger.warning("Reranker non disponible ({}), fallback ranking Vespa", exc)
+
         self.intent_classifier: IntentClassifier | None = None
-        if _INTENT_CLASSIFIER_AVAILABLE:
+        if self.enable_intent_classifier and _INTENT_CLASSIFIER_AVAILABLE:
             try:
                 self.intent_classifier = IntentClassifier(shared_embeddings=self.embeddings)
                 stats = self.intent_classifier.get_stats()
@@ -173,6 +205,8 @@ class RAGPipeline:
                 )
             except Exception as exc:
                 logger.warning("IntentClassifier init echoue: {} - gate desactive", exc)
+        elif not self.enable_intent_classifier:
+            logger.info("IntentClassifier desactive par configuration")
 
         self.collection_count = self._get_doc_count()
         logger.info("Vespa schema doc: {} chunks", self.collection_count)
@@ -362,6 +396,25 @@ CONTEXTE DOCUMENTAIRE:
             total += len(chunk) + 1
         return "\n".join(parts)
 
+    def _context_payload(self, docs: list[Document]) -> dict:
+        context_items = [
+            {
+                "text": doc.page_content or "",
+                "metadata": dict(doc.metadata or {}),
+            }
+            for doc in docs
+        ]
+        return {
+            "contexts": [item["text"] for item in context_items],
+            "context_metadata": [item["metadata"] for item in context_items],
+            "context_items": context_items,
+        }
+
+    def _maybe_attach_contexts(self, payload: dict, docs: list[Document], include_contexts: bool) -> dict:
+        if include_contexts:
+            return {**payload, **self._context_payload(docs)}
+        return payload
+
     def _cache_get(self, key: str) -> dict | None:
         entry = self.response_cache.get(key)
         if entry:
@@ -374,6 +427,55 @@ CONTEXTE DOCUMENTAIRE:
         while len(self.response_cache) > RAG_CACHE_SIZE:
             self.response_cache.popitem(last=False)
 
+    @staticmethod
+    def _doc_priority(doc: Document) -> int:
+        source_type = str(doc.metadata.get("source_type", "")).lower()
+        if source_type == "faq":
+            return 3
+        if source_type == "web":
+            return 2
+        if source_type == "bibliotheque":
+            return 1
+        return 0
+
+    def _rerank_docs(self, query: str, candidates: list[Document]) -> list[Document]:
+        if not candidates:
+            return []
+        if self.shared_reranker is None:
+            return candidates[: self.final_k]
+
+        pairs = [(query, doc.page_content[:600]) for doc in candidates]
+        try:
+            raw_scores = self.shared_reranker.predict(pairs).tolist()
+            ranked = sorted(
+                (
+                    (
+                        score + (FAQ_RERANK_BOOST if self._doc_priority(doc) >= 3 else 0.0),
+                        score,
+                        doc,
+                    )
+                    for score, doc in zip(raw_scores, candidates)
+                ),
+                key=lambda item: item[0],
+                reverse=True,
+            )
+            top_docs = []
+            for rank, (score, raw_score, doc) in enumerate(ranked[: self.final_k], start=1):
+                doc.metadata["vespa_rerank_score"] = float(score)
+                doc.metadata["vespa_rerank_raw_score"] = float(raw_score)
+                doc.metadata["vespa_rerank_rank"] = rank
+                top_docs.append(doc)
+            logger.info(
+                "Reranking Vespa docs: {} candidats -> {} retenus (meilleur score: {:.4f})",
+                len(candidates),
+                len(top_docs),
+                ranked[0][0] if ranked else 0.0,
+            )
+            return top_docs
+        except Exception as exc:
+            logger.warning("Reranker erreur sur Vespa ({}), fallback ranking Vespa", exc)
+            return candidates[: self.final_k]
+
     def _retrieve_docs_vespa(self, query: str, query_embedding: list[float], org: str = "all") -> list[Document]:
         hits = query_schema(
             self.vespa,
@@ -382,12 +484,12 @@ CONTEXTE DOCUMENTAIRE:
             query_embedding=query_embedding,
             org=org,
             target_hits=self.retrieval_k,
-            hits=self.final_k,
+            hits=self.retrieval_k,
         )
-        docs = []
-        for hit in hits:
+        candidates = []
+        for index, hit in enumerate(hits, start=1):
             fields = hit.fields
-            docs.append(
+            candidates.append(
                 Document(
                     page_content=fields.get("text", ""),
                     metadata={
@@ -398,14 +500,154 @@ CONTEXTE DOCUMENTAIRE:
                         "relative_source": fields.get("relative_source", ""),
                         "chunk_index": fields.get("chunk_index", 0),
                         "vespa_relevance": hit.relevance,
+                        "vespa_rank": index,
                     },
                 )
             )
-        return docs
+        return self._rerank_docs(query, candidates)
 
-    def _retrieve_videos(self, query: str, query_embedding: list[float], org: str = "all") -> list[dict]:
+    @staticmethod
+    def _video_rerank_text(fields: dict) -> str:
+        title = fields.get("title", "")
+        transcript = fields.get("transcript", "")
+        return f"Titre: {title}\n\n{transcript[:600]}".strip()
+
+    def _format_video_hit(
+        self,
+        hit,
+        *,
+        score: float,
+        rerank_score: float | None = None,
+        rank: int = 0,
+        ranking_mode: str = "vespa",
+    ) -> dict:
+        fields = hit.fields
+        return {
+            "video_id": fields.get("video_id", ""),
+            "title": fields.get("title", ""),
+            "url": fields.get("url", ""),
+            "thumbnail_url": fields.get("thumbnail_url", ""),
+            "upload_date": fields.get("upload_date", ""),
+            "org": fields.get("org", ""),
+            "score": float(score),
+            "vespa_score": float(hit.relevance),
+            "rerank_score": float(rerank_score) if rerank_score is not None else None,
+            "rank": rank,
+            "ranking_mode": ranking_mode,
+        }
+
+    def _rank_video_hits(
+        self,
+        query: str,
+        hits: list,
+        *,
+        limit: int,
+        threshold: float,
+        threshold_is_explicit: bool = False,
+    ) -> tuple[list[dict], list[dict]]:
+        if not hits:
+            return [], []
+
+        vespa_threshold = threshold if threshold_is_explicit else VIDEO_RELEVANCE_THRESHOLD
+        if self.shared_reranker is None:
+            candidates = [
+                self._format_video_hit(hit, score=hit.relevance, rank=index)
+                for index, hit in enumerate(hits, start=1)
+            ]
+            filtered = [item for item in candidates if item["score"] >= vespa_threshold]
+            return filtered[:limit], candidates
+
+        pairs = [(query, self._video_rerank_text(hit.fields)) for hit in hits]
+        try:
+            raw_scores = self.shared_reranker.predict(pairs)
+            if hasattr(raw_scores, "tolist"):
+                raw_scores = raw_scores.tolist()
+            scores = [float(score) for score in raw_scores]
+        except Exception as exc:
+            logger.warning("Reranker erreur sur videos Vespa ({}), fallback score Vespa", exc)
+            candidates = [
+                self._format_video_hit(hit, score=hit.relevance, rank=index)
+                for index, hit in enumerate(hits, start=1)
+            ]
+            filtered = [item for item in candidates if item["score"] >= vespa_threshold]
+            return filtered[:limit], candidates
+
+        best_per_video: dict[str, dict] = {}
+        for hit, rerank_score in zip(hits, scores):
+            video_id = hit.fields.get("video_id", "")
+            if not video_id:
+                continue
+            item = self._format_video_hit(
+                hit,
+                score=rerank_score,
+                rerank_score=rerank_score,
+                ranking_mode="rerank",
+            )
+            previous = best_per_video.get(video_id)
+            if previous is None or item["rerank_score"] > previous["rerank_score"]:
+                best_per_video[video_id] = item
+
+        reranked = sorted(
+            best_per_video.values(),
+            key=lambda item: (item["rerank_score"], item["vespa_score"]),
+            reverse=True,
+        )
+        if not reranked:
+            return [], []
+
+        top_score = reranked[0]["rerank_score"]
+        runner_up_score = reranked[1]["rerank_score"] if len(reranked) > 1 else float("-inf")
+        use_rerank_order = (
+            top_score >= VIDEO_RERANK_CONFIDENCE_THRESHOLD
+            and top_score - runner_up_score >= VIDEO_RERANK_MARGIN_THRESHOLD
+        )
+
+        if use_rerank_order:
+            candidates = reranked
+            active_threshold = threshold
+            ranking_mode = "rerank"
+            for item in candidates:
+                item["score"] = item["rerank_score"]
+        else:
+            candidates = sorted(
+                best_per_video.values(),
+                key=lambda item: (item["vespa_score"], item["rerank_score"]),
+                reverse=True,
+            )
+            active_threshold = vespa_threshold
+            ranking_mode = "vespa"
+            for item in candidates:
+                item["score"] = item["vespa_score"]
+
+        for rank, item in enumerate(candidates, start=1):
+            item["rank"] = rank
+            item["ranking_mode"] = ranking_mode
+        filtered = [item for item in candidates if item["score"] >= active_threshold]
+        return filtered[:limit], candidates
+
+    def _retrieve_videos_with_debug(
+        self,
+        query: str,
+        query_embedding: list[float],
+        org: str = "all",
+        *,
+        limit: int | None = None,
+        target_hits: int | None = None,
+        threshold: float | None = None,
+    ) -> tuple[list[dict], list[dict]]:
         if not self.enable_video_suggestions:
-            return []
+            return [], []
+        final_k = limit or VIDEO_FINAL_K
+        candidate_k = max(target_hits or VIDEO_RETRIEVE_K, final_k)
+        threshold_is_explicit = threshold is not None
+        if threshold is None:
+            min_score = (
+                VIDEO_RERANK_RELEVANCE_THRESHOLD
+                if self.shared_reranker is not None
+                else VIDEO_RELEVANCE_THRESHOLD
+            )
+        else:
+            min_score = threshold
         try:
             hits = query_schema(
                 self.vespa,
@@ -413,29 +655,122 @@ CONTEXTE DOCUMENTAIRE:
                 query_text=query,
                 query_embedding=query_embedding,
                 org=org,
-                target_hits=VIDEO_RETRIEVE_K,
-                hits=VIDEO_RETRIEVE_K,
+                target_hits=candidate_k,
+                hits=candidate_k,
             )
-            hits = [h for h in hits if h.relevance >= VIDEO_RELEVANCE_THRESHOLD][:VIDEO_FINAL_K]
-            return [
-                {
-                    "video_id": h.fields.get("video_id", ""),
-                    "title": h.fields.get("title", ""),
-                    "url": h.fields.get("url", ""),
-                    "thumbnail_url": h.fields.get("thumbnail_url", ""),
-                    "upload_date": h.fields.get("upload_date", ""),
-                    "org": h.fields.get("org", ""),
-                    "score": h.relevance,
-                }
-                for h in hits
-            ]
+            return self._rank_video_hits(
+                query,
+                hits,
+                limit=final_k,
+                threshold=min_score,
+                threshold_is_explicit=threshold_is_explicit,
+            )
         except Exception as exc:
             logger.warning("Erreur recherche video Vespa: {}", exc)
-            return []
+            return [], []
 
-    def _retrieve_forms(self, query: str, query_embedding: list[float], org: str = "all") -> list[dict]:
+    def _retrieve_videos(self, query: str, query_embedding: list[float], org: str = "all") -> list[dict]:
+        results, _ = self._retrieve_videos_with_debug(
+            query,
+            query_embedding,
+            org=org,
+        )
+        return results
+
+    @staticmethod
+    def _form_rerank_text(fields: dict) -> str:
+        parts = [
+            f"Formulaire : {fields.get('title', '')}",
+            f"Categorie : {fields.get('category', '')}",
+        ]
+        content = str(fields.get("content", "") or "").strip()
+        if content:
+            parts.append(content[:600])
+        return "\n".join(part for part in parts if part.strip())
+
+    def _format_form_hit(self, hit, *, score: float, rerank_score: float | None = None, rank: int = 0) -> dict:
+        fields = hit.fields
+        return {
+            "form_id": fields.get("form_id", ""),
+            "title": fields.get("title", ""),
+            "category": fields.get("category", ""),
+            "pdf_url": fields.get("pdf_url", ""),
+            "page_url": fields.get("page_url", ""),
+            "org": fields.get("org", ""),
+            "score": float(score),
+            "vespa_score": float(hit.relevance),
+            "rerank_score": float(rerank_score) if rerank_score is not None else None,
+            "rank": rank,
+        }
+
+    def _rank_form_hits(
+        self,
+        query: str,
+        hits: list,
+        *,
+        limit: int,
+        threshold: float,
+    ) -> tuple[list[dict], list[dict]]:
+        if not hits:
+            return [], []
+
+        if self.shared_reranker is None:
+            candidates = [
+                self._format_form_hit(hit, score=hit.relevance, rank=index)
+                for index, hit in enumerate(hits, start=1)
+            ]
+            filtered = [item for item in candidates if item["score"] >= threshold]
+            return filtered[:limit], candidates
+
+        pairs = [(query, self._form_rerank_text(hit.fields)) for hit in hits]
+        try:
+            scores = [float(score) for score in self.shared_reranker.predict(pairs).tolist()]
+        except Exception as exc:
+            logger.warning("Reranker erreur sur formulaires Vespa ({}), fallback score Vespa", exc)
+            candidates = [
+                self._format_form_hit(hit, score=hit.relevance, rank=index)
+                for index, hit in enumerate(hits, start=1)
+            ]
+            filtered = [item for item in candidates if item["score"] >= threshold]
+            return filtered[:limit], candidates
+
+        best_per_form: dict[str, dict] = {}
+        for hit, rerank_score in zip(hits, scores):
+            item = self._format_form_hit(hit, score=rerank_score, rerank_score=rerank_score)
+            form_id = item["form_id"]
+            if not form_id:
+                continue
+            if form_id not in best_per_form or item["score"] > best_per_form[form_id]["score"]:
+                best_per_form[form_id] = item
+
+        candidates = sorted(best_per_form.values(), key=lambda item: item["score"], reverse=True)
+        for rank, item in enumerate(candidates, start=1):
+            item["rank"] = rank
+        filtered = [item for item in candidates if item["score"] >= threshold]
+        return filtered[:limit], candidates
+
+    def _retrieve_forms_with_debug(
+        self,
+        query: str,
+        query_embedding: list[float],
+        org: str = "all",
+        *,
+        limit: int | None = None,
+        target_hits: int | None = None,
+        threshold: float | None = None,
+    ) -> tuple[list[dict], list[dict]]:
         if not self.enable_form_suggestions:
-            return []
+            return [], []
+        final_k = limit or FORM_FINAL_K
+        candidate_k = max(target_hits or FORM_RETRIEVE_K, final_k)
+        if threshold is None:
+            min_score = (
+                FORM_RERANK_RELEVANCE_THRESHOLD
+                if self.shared_reranker is not None
+                else FORM_RELEVANCE_THRESHOLD
+            )
+        else:
+            min_score = threshold
         try:
             hits = query_schema(
                 self.vespa,
@@ -443,25 +778,85 @@ CONTEXTE DOCUMENTAIRE:
                 query_text=query,
                 query_embedding=query_embedding,
                 org=org,
-                target_hits=FORM_RETRIEVE_K,
-                hits=FORM_RETRIEVE_K,
+                target_hits=candidate_k,
+                hits=candidate_k,
             )
-            hits = [h for h in hits if h.relevance >= FORM_RELEVANCE_THRESHOLD][:FORM_FINAL_K]
-            return [
-                {
-                    "form_id": h.fields.get("form_id", ""),
-                    "title": h.fields.get("title", ""),
-                    "category": h.fields.get("category", ""),
-                    "pdf_url": h.fields.get("pdf_url", ""),
-                    "page_url": h.fields.get("page_url", ""),
-                    "org": h.fields.get("org", ""),
-                    "score": h.relevance,
-                }
-                for h in hits
-            ]
+            return self._rank_form_hits(query, hits, limit=final_k, threshold=min_score)
         except Exception as exc:
             logger.warning("Erreur recherche formulaires Vespa: {}", exc)
-            return []
+            return [], []
+
+    def _retrieve_forms(
+        self,
+        query: str,
+        query_embedding: list[float],
+        org: str = "all",
+        *,
+        limit: int | None = None,
+        target_hits: int | None = None,
+        threshold: float | None = None,
+    ) -> list[dict]:
+        results, _ = self._retrieve_forms_with_debug(
+            query,
+            query_embedding,
+            org=org,
+            limit=limit,
+            target_hits=target_hits,
+            threshold=threshold,
+        )
+        return results
+
+    def retrieve_videos(
+        self,
+        query: str,
+        org: str = "all",
+        limit: int | None = None,
+        *,
+        target_hits: int | None = None,
+        threshold: float | None = None,
+        include_debug: bool = False,
+    ) -> list[dict] | dict:
+        cleaned = (query or "").strip()
+        if not cleaned:
+            return {"results": [], "candidates": []} if include_debug else []
+        query_embedding = self.embeddings.embed_query(cleaned)
+        results, candidates = self._retrieve_videos_with_debug(
+            cleaned,
+            query_embedding,
+            org=org,
+            limit=limit,
+            target_hits=target_hits,
+            threshold=threshold,
+        )
+        if include_debug:
+            return {"results": results, "candidates": candidates}
+        return results
+
+    def retrieve_forms(
+        self,
+        query: str,
+        org: str = "all",
+        limit: int | None = None,
+        *,
+        target_hits: int | None = None,
+        threshold: float | None = None,
+        include_debug: bool = False,
+    ) -> list[dict] | dict:
+        cleaned = (query or "").strip()
+        if not cleaned:
+            return {"results": [], "candidates": []} if include_debug else []
+        query_embedding = self.embeddings.embed_query(cleaned)
+        results, candidates = self._retrieve_forms_with_debug(
+            cleaned,
+            query_embedding,
+            org=org,
+            limit=limit,
+            target_hits=target_hits,
+            threshold=threshold,
+        )
+        if include_debug:
+            return {"results": results, "candidates": candidates}
+        return results
 
     def _is_resource_only_query(self, query: str, resource: str) -> bool:
         normalized = self._normalize_text(query)
@@ -479,7 +874,9 @@ CONTEXTE DOCUMENTAIRE:
             "intent": "retrieval",
             "confidence": 0.0,
             "tier": 1,
-            "reasoning": "IntentClassifier unavailable",
+            "reasoning": "IntentClassifier disabled"
+            if not self.enable_intent_classifier
+            else "IntentClassifier unavailable",
             "loaded": False,
         }
 
@@ -565,7 +962,13 @@ CONTEXTE DOCUMENTAIRE:
             return self.intent_classifier.should_retrieve_forms(classification)
         return False
 
-    def query(self, query: str, org: str = "all") -> dict:
+    def query(
+        self,
+        query: str,
+        org: str = "all",
+        include_contexts: bool = False,
+        use_intent_classifier: bool = True,
+    ) -> dict:
         cleaned = (query or "").strip()
         if not cleaned:
             return self._error_response("Veuillez saisir une question.", query)
@@ -575,38 +978,57 @@ CONTEXTE DOCUMENTAIRE:
             logger.info("Off-scope detecte (org={}, cible={})", org, offscope)
             return self._offscope_response(org, offscope, query)
 
-        cache_key = f"{org}:{cleaned.lower()}"
+        mode = "intent" if use_intent_classifier else "docs"
+        cache_key = f"{org}:{mode}:{cleaned.lower()}"
         if hit := self._cache_get(cache_key):
-            return {**hit, "original_query": query, "cached": True}
-
-        classification = self._classify_intent(cleaned)
-        intent = classification.get("intent", "retrieval")
-
-        if intent == "greeting":
-            payload = self._simple_payload(self._greeting_response(org), query, org, classification)
-            self._cache_set(cache_key, {k: v for k, v in payload.items() if k not in {"original_query", "cached"}})
+            payload = {**hit, "original_query": query, "cached": True}
+            if include_contexts:
+                try:
+                    query_embedding = self.embeddings.embed_query(cleaned)
+                    docs = self._retrieve_docs_vespa(cleaned, query_embedding, org=org)
+                    payload = self._maybe_attach_contexts(payload, docs, include_contexts=True)
+                    payload["context_docs"] = len(docs)
+                except Exception as exc:
+                    logger.warning("Impossible de recuperer les contextes pour cache hit: {}", exc)
+                    payload = {**payload, "contexts": [], "context_metadata": [], "context_items": []}
             return payload
 
-        if intent == "prompt_injection":
-            payload = self._simple_payload(
-                "Je ne peux pas suivre cette demande. Je peux uniquement aider avec des informations officielles RCAR/CNRA a partir de la base documentaire.",
-                query,
-                org,
-                classification,
-            )
-            self._cache_set(cache_key, {k: v for k, v in payload.items() if k not in {"original_query", "cached"}})
-            return payload
+        if use_intent_classifier:
+            classification = self._classify_intent(cleaned)
+            intent = classification.get("intent", "retrieval")
 
-        if self._should_short_circuit_out_of_scope(cleaned, classification):
-            payload = self._simple_payload(
-                "Cette question ne concerne pas le RCAR ou la CNRA. Je peux uniquement repondre aux questions liees a ces organismes et a leurs procedures.",
-                query,
-                org,
-                classification,
-                intent="out_of_scope",
-            )
-            self._cache_set(cache_key, {k: v for k, v in payload.items() if k not in {"original_query", "cached"}})
-            return payload
+            if intent == "greeting":
+                payload = self._simple_payload(self._greeting_response(org), query, org, classification)
+                self._cache_set(cache_key, {k: v for k, v in payload.items() if k not in {"original_query", "cached"}})
+                return payload
+
+            if intent == "prompt_injection":
+                payload = self._simple_payload(
+                    "Je ne peux pas suivre cette demande. Je peux uniquement aider avec des informations officielles RCAR/CNRA a partir de la base documentaire.",
+                    query,
+                    org,
+                    classification,
+                )
+                self._cache_set(cache_key, {k: v for k, v in payload.items() if k not in {"original_query", "cached"}})
+                return payload
+
+            if self._should_short_circuit_out_of_scope(cleaned, classification):
+                payload = self._simple_payload(
+                    "Cette question ne concerne pas le RCAR ou la CNRA. Je peux uniquement repondre aux questions liees a ces organismes et a leurs procedures.",
+                    query,
+                    org,
+                    classification,
+                    intent="out_of_scope",
+                )
+                self._cache_set(cache_key, {k: v for k, v in payload.items() if k not in {"original_query", "cached"}})
+                return payload
+        else:
+            classification = {
+                "intent": "retrieval",
+                "confidence": 1.0,
+                "tier": 0,
+                "reasoning": "intent classifier disabled",
+            }
 
         if self.collection_count == 0:
             return self._error_response(
@@ -633,8 +1055,8 @@ CONTEXTE DOCUMENTAIRE:
             return self._error_response("Aucun passage pertinent trouve.", query, context_docs=0)
 
         videos, forms = [], []
-        run_videos = self._should_run_auxiliary_retriever(classification, "video", cleaned)
-        run_forms = self._should_run_auxiliary_retriever(classification, "form", cleaned)
+        run_videos = use_intent_classifier and self._should_run_auxiliary_retriever(classification, "video", cleaned)
+        run_forms = use_intent_classifier and self._should_run_auxiliary_retriever(classification, "form", cleaned)
 
         t_aux = time.perf_counter()
         if run_videos:
@@ -661,7 +1083,8 @@ CONTEXTE DOCUMENTAIRE:
                 "org": org,
             }
             self._cache_set(cache_key, payload)
-            return {**payload, "original_query": query, "cached": False}
+            result = {**payload, "original_query": query, "cached": False}
+            return self._maybe_attach_contexts(result, docs, include_contexts)
 
         if forms and self._is_resource_only_query(cleaned, "form"):
             payload = {
@@ -674,7 +1097,8 @@ CONTEXTE DOCUMENTAIRE:
                 "org": org,
             }
             self._cache_set(cache_key, payload)
-            return {**payload, "original_query": query, "cached": False}
+            result = {**payload, "original_query": query, "cached": False}
+            return self._maybe_attach_contexts(result, docs, include_contexts)
 
         t1 = time.perf_counter()
         try:
@@ -711,7 +1135,8 @@ CONTEXTE DOCUMENTAIRE:
             "org": org,
         }
         self._cache_set(cache_key, payload)
-        return {**payload, "original_query": query, "cached": False}
+        result = {**payload, "original_query": query, "cached": False}
+        return self._maybe_attach_contexts(result, docs, include_contexts)
 
 
 if __name__ == "__main__":
