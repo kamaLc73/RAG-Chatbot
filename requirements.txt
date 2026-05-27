@@ -22,3 +22,7 @@ yt-dlp>=2024.1.1
 youtube-transcript-api>=0.6.0
 openai-whisper>=20231117
 tqdm>=4.66.0
+ragas>=0.4.3
+langchain-openai>=0.3.0
+datasets>=3.0.0
+pandas>=2.2.0

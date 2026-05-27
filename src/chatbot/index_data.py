@@ -33,9 +33,14 @@ LOG_DIR.mkdir(parents=True, exist_ok=True)
 LOG_FILE = LOG_DIR / "index_data.log"
 
 TARGET_SITES = ("rcar", "cnra")
-TARGET_SOURCE_TYPES = ("faq",)
+TARGET_SOURCE_TYPES = ("faq", "web", "bibliotheque")
 TARGET_LANGUAGE = "fr"
 SUPPORTED_EXTENSIONS = (".md", ".txt")
+SOURCE_TYPE_PRIORITY = {
+    "faq": 3,
+    "web": 2,
+    "bibliotheque": 1,
+}
 
 DEFAULT_EMBEDDING_MODEL = "BAAI/bge-m3"
 EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", DEFAULT_EMBEDDING_MODEL)
@@ -44,6 +49,7 @@ DEFAULT_VECTORSTORE_DIR = PROJECT_ROOT / "data" / "vectorstore" / "chroma_db_uni
 
 DEFAULT_CHUNK_SIZE    = 1200  # Nombre de caractères par chunk
 DEFAULT_CHUNK_OVERLAP = 180
+INDEX_BATCH_SIZE      = 64
 
 logging.basicConfig(
     level=logging.INFO,
@@ -137,7 +143,7 @@ def collect_files(
     source_types=TARGET_SOURCE_TYPES,
     language=TARGET_LANGUAGE,
 ):
-    """Collect FAQ documents recursively for RCAR and CNRA."""
+    """Collect prepared documents recursively for RCAR and CNRA."""
     root = _resolve_project_path(processed_root)
     collected = []
 
@@ -153,15 +159,15 @@ def collect_files(
             md_count  = sum(1 for file in files if file.suffix.lower() == ".md")
             txt_count = sum(1 for file in files if file.suffix.lower() == ".txt")
             logging.info(
-                "%s: %s fichiers FAQ (md=%s, txt=%s)",
-                folder, len(files), md_count, txt_count,
+                "%s: %s fichiers %s (md=%s, txt=%s)",
+                folder, len(files), source_type, md_count, txt_count,
             )
 
     return collected
 
 
 def load_documents(file_paths, processed_root=DEFAULT_PROCESSED_ROOT):
-    """Load FAQ files into LangChain Document objects with metadata."""
+    """Load prepared files into LangChain Document objects with metadata."""
     root = _resolve_project_path(processed_root)
     documents = []
 
@@ -180,17 +186,18 @@ def load_documents(file_paths, processed_root=DEFAULT_PROCESSED_ROOT):
             parts = relative.parts
             site        = parts[0] if len(parts) > 0 else "unknown"
             source_type = parts[1] if len(parts) > 1 else "unknown"
-            faq_scope   = parts[2] if len(parts) > 2 else "unknown"
+            doc_scope   = parts[2] if len(parts) > 2 else "unknown"
             topic       = "/".join(parts[3:-1]) if len(parts) > 4 else ""
             language    = TARGET_LANGUAGE
         except Exception:
             relative    = file_path
             site        = "unknown"
             source_type = "unknown"
-            faq_scope   = "unknown"
+            doc_scope   = "unknown"
             topic       = ""
             language    = TARGET_LANGUAGE
 
+        source_priority = SOURCE_TYPE_PRIORITY.get(source_type, 0)
         documents.append(
             Document(
                 page_content=text,
@@ -201,8 +208,11 @@ def load_documents(file_paths, processed_root=DEFAULT_PROCESSED_ROOT):
                     "type":            "doc",
                     "site":            site,
                     "source_type":     source_type,
-                    "faq_scope":       faq_scope,
-                    "faq_topic":       topic,
+                    "source_priority": source_priority,
+                    "faq_scope":       doc_scope if source_type == "faq" else "",
+                    "doc_scope":       doc_scope,
+                    "faq_topic":       topic if source_type == "faq" else "",
+                    "doc_topic":       topic,
                     "language":        language,
                     "file_name":       file_path.name,
                     "file_extension":  file_path.suffix.lower(),
@@ -379,7 +389,14 @@ def index_data(
         raise
 
     # ── Indexation ────────────────────────────────────────────────────────────
-    vectorstore.add_documents(chunks)
+    for start in range(0, len(chunks), INDEX_BATCH_SIZE):
+        batch = chunks[start:start + INDEX_BATCH_SIZE]
+        vectorstore.add_documents(batch)
+        logging.info(
+            "Batch docs %s/%s indexe",
+            min(start + INDEX_BATCH_SIZE, len(chunks)),
+            len(chunks),
+        )
 
     logging.info("ChromaDB sauvegarde dans %s", persist_path)
     logging.info("Collection: %s", collection_name)

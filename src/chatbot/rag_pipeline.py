@@ -114,6 +114,7 @@ RAG_FINAL_K           = 4     # Chunks finaux après reranking
 RAG_MAX_CONTEXT_CHARS = 4000
 RAG_MAX_DOC_CHARS     = 1000
 RAG_CACHE_SIZE        = 100
+FAQ_RERANK_BOOST      = 0.20
 
 # ── Mots-cles off-scope par organisme (texte normalise ASCII) ───────────────
 CNRA_KEYWORDS = {
@@ -159,6 +160,7 @@ class RAGPipeline:
         vectorstore_path: Path | str = VECTORSTORE_RELATIVE_PATH,
         collection_name: str = "rcar_cnra_unified",
         embedding_model: str = DEFAULT_EMBEDDING_MODEL,
+        enable_intent_classifier: bool = True,
         enable_video_suggestions: bool = True,
         enable_form_suggestions:  bool = True,
     ):
@@ -167,7 +169,7 @@ class RAGPipeline:
             resolved_path = (BASE_DIR / resolved_path).resolve()
 
         self.collection_name   = collection_name
-        self.retrieval_k       = RAG_RETRIEVE_K
+        self.retrieval_k       = max(RAG_RETRIEVE_K, RAG_FINAL_K * 6)
         self.final_k           = RAG_FINAL_K
         self.max_context_chars = RAG_MAX_CONTEXT_CHARS
         self.max_doc_chars     = RAG_MAX_DOC_CHARS
@@ -206,7 +208,7 @@ class RAGPipeline:
 
         # ── Intent Classifier (réutilise les embeddings partagés) ─────────────
         self.intent_classifier: IntentClassifier | None = None
-        if _INTENT_CLASSIFIER_AVAILABLE:
+        if enable_intent_classifier and _INTENT_CLASSIFIER_AVAILABLE:
             try:
                 self.intent_classifier = IntentClassifier(
                     shared_embeddings=self.embeddings,
@@ -555,6 +557,20 @@ class RAGPipeline:
         while len(self.response_cache) > RAG_CACHE_SIZE:
             self.response_cache.popitem(last=False)
 
+    @staticmethod
+    def _doc_priority(doc) -> int:
+        source_type = str(doc.metadata.get("source_type", "")).lower()
+        if source_type == "faq":
+            return 3
+        if source_type == "web":
+            return 2
+        if source_type == "bibliotheque":
+            return 1
+        try:
+            return int(doc.metadata.get("source_priority", 0))
+        except (TypeError, ValueError):
+            return 0
+
     def _retrieve_and_rerank_docs(self, query: str, org: str = "all") -> list:
         """
         Recherche vectorielle sur chroma_db + reranking cross-encoder.
@@ -581,7 +597,11 @@ class RAGPipeline:
         if self.shared_reranker is not None:
             pairs = [(query, doc.page_content[:600]) for doc in candidates]
             try:
-                scores = self.shared_reranker.predict(pairs).tolist()
+                raw_scores = self.shared_reranker.predict(pairs).tolist()
+                scores = [
+                    score + (FAQ_RERANK_BOOST if self._doc_priority(doc) >= 3 else 0.0)
+                    for score, doc in zip(raw_scores, candidates)
+                ]
 
                 logger.debug("── Reranking chroma_db ({} candidats) ──", len(candidates))
                 ranked = sorted(
@@ -592,8 +612,8 @@ class RAGPipeline:
                 for i, (sc, doc) in enumerate(ranked):
                     src = doc.metadata.get("relative_source", doc.metadata.get("source", "?"))
                     logger.debug(
-                        "  [{}/{}] score={:.4f} | {}",
-                        i + 1, len(ranked), sc,
+                        "  [{}/{}] score={:.4f} | priority={} | {}",
+                        i + 1, len(ranked), sc, self._doc_priority(doc),
                         src.split("/")[-1][:60] if src else "?"
                     )
 
@@ -609,7 +629,16 @@ class RAGPipeline:
                 logger.warning("Reranker erreur sur chroma_db ({}), fallback vectoriel", exc)
 
         # Fallback : pas de reranker → top RAG_FINAL_K résultats vectoriels
-        return candidates[: self.final_k]
+        ranked = sorted(
+            enumerate(candidates),
+            key=lambda item: (self._doc_priority(item[1]), -item[0]),
+            reverse=True,
+        )
+        return [doc for _, doc in ranked[: self.final_k]]
+
+    def retrieve_documents(self, query: str, org: str = "all") -> list:
+        """Evaluation-friendly public wrapper around document retrieval."""
+        return self._retrieve_and_rerank_docs(query, org=org)
 
     def _retrieve_videos(self, query: str, org: str = "all") -> list[dict]:
         if not self.video_retriever or not self.video_retriever.available:
@@ -629,9 +658,27 @@ class RAGPipeline:
             logger.warning("Erreur recherche formulaires: {}", exc)
             return []
 
+    def retrieve_videos(self, query: str, org: str = "all", limit: int | None = None) -> list[dict]:
+        """Return video retrieval results without running chat generation."""
+        videos = self._retrieve_videos(query, org=org)
+        return videos[:limit] if limit else videos
+
+    def retrieve_forms(self, query: str, org: str = "all", limit: int | None = None) -> list[dict]:
+        """Return form retrieval results without running chat generation."""
+        forms = self._retrieve_forms(query, org=org)
+        return forms[:limit] if limit else forms
+
     # ── API publique ──────────────────────────────────────────────────────────
 
-    def query(self, query: str, org: str = "all") -> dict:
+    def query(
+        self,
+        query: str,
+        org: str = "all",
+        include_contexts: bool = False,
+        use_intent_classifier: bool = True,
+        include_resources: bool = True,
+        **_: object,
+    ) -> dict:
         """
         Traite une question utilisateur avec filtrage par organisme.
 
@@ -656,7 +703,7 @@ class RAGPipeline:
 
         # ── Cache ─────────────────────────────────────────────────────────────
         # Clé de cache incluant l'org (évite les collisions inter-orgs)
-        cache_key = f"{org}:{cleaned.lower()}"
+        cache_key = f"{org}:{cleaned.lower()}:{include_contexts}:{use_intent_classifier}:{include_resources}"
         # Renommé 'hit' pour éviter la collision de nom avec la clé "cached"
         # du payload retourné dans le dict déballé juste après.
         if hit := self._cache_get(cache_key):
@@ -692,7 +739,7 @@ class RAGPipeline:
         videos, forms = [], []
         classification = {"intent": "retrieval", "confidence": 0.0, "loaded": False}
 
-        if self.intent_classifier and self.intent_classifier.is_loaded:
+        if use_intent_classifier and self.intent_classifier and self.intent_classifier.is_loaded:
             try:
                 classification = self.intent_classifier.classify(cleaned)
                 logger.info(
@@ -702,13 +749,15 @@ class RAGPipeline:
             except Exception as exc:
                 logger.warning("Intent classification échouée: {} — gate pass-through", exc)
 
-        run_videos = (
+        run_videos = include_resources and (
             self.intent_classifier is None or
+            not use_intent_classifier or
             not self.intent_classifier.is_loaded or
             self.intent_classifier.should_retrieve_videos(classification)
         )
-        run_forms = (
+        run_forms = include_resources and (
             self.intent_classifier is None or
+            not use_intent_classifier or
             not self.intent_classifier.is_loaded or
             self.intent_classifier.should_retrieve_forms(classification)
         )
@@ -767,6 +816,15 @@ class RAGPipeline:
             "intent_confidence": classification.get("confidence", 0.0),
             "org":               org,
         }
+        if include_contexts:
+            payload.update({
+                "contexts": [doc.page_content for doc in docs],
+                "context_metadata": [dict(doc.metadata or {}) for doc in docs],
+                "context_items": [
+                    {"text": doc.page_content, "metadata": dict(doc.metadata or {})}
+                    for doc in docs
+                ],
+            })
         self._cache_set(cache_key, payload)
         return {**payload, "original_query": query, "cached": False}
 
