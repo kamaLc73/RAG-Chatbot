@@ -74,10 +74,29 @@ RAG_FINAL_K = 4
 RAG_MAX_CONTEXT_CHARS = 4000
 RAG_MAX_DOC_CHARS = 1000
 RAG_CACHE_SIZE = 100
-FAQ_RERANK_BOOST = 0.20
+DOC_RERANK_CANDIDATES_PER_FINAL = 8
+OFFICIAL_DOC_RETRIEVE_K = 96
+FAQ_RERANK_BOOST = 0.10
+OFFICIAL_DOC_NONFAQ_RERANK_BOOST = 0.28
+OFFICIAL_DOC_BIBLIOTHEQUE_EXTRA_BOOST = 0.05
+OFFICIAL_DOC_FAQ_RERANK_PENALTY = -0.05
+OFFICIAL_DOC_QUERY_TERMS = (
+    " document officiel ",
+    " documents officiels ",
+    " informations officielles ",
+    " texte officiel ",
+    " textes officiels ",
+    " decret ",
+    " reglement ",
+    " loi ",
+    " arrete ",
+    " dahir ",
+    " circulaire ",
+    " galerie documentaire ",
+)
 
 VIDEO_RETRIEVE_K = 10
-VIDEO_FINAL_K = 2
+VIDEO_FINAL_K = 1
 FORM_RETRIEVE_K = 10
 FORM_FINAL_K = 1
 VIDEO_RELEVANCE_THRESHOLD = 0.185
@@ -140,7 +159,7 @@ class RAGPipeline:
         self.enable_video_suggestions = enable_video_suggestions
         self.enable_form_suggestions = enable_form_suggestions
         self.enable_intent_classifier = enable_intent_classifier
-        self.retrieval_k = max(RAG_RETRIEVE_K, RAG_FINAL_K * 6)
+        self.retrieval_k = max(RAG_RETRIEVE_K, RAG_FINAL_K * DOC_RERANK_CANDIDATES_PER_FINAL)
         self.final_k = RAG_FINAL_K
         self.max_context_chars = RAG_MAX_CONTEXT_CHARS
         self.max_doc_chars = RAG_MAX_DOC_CHARS
@@ -428,8 +447,40 @@ CONTEXTE DOCUMENTAIRE:
             self.response_cache.popitem(last=False)
 
     @staticmethod
-    def _doc_priority(doc: Document) -> int:
-        source_type = str(doc.metadata.get("source_type", "")).lower()
+    def _doc_source_type(doc: Document) -> str:
+        return str(doc.metadata.get("source_type", "")).lower()
+
+    def _is_official_doc_query(self, normalized_query: str) -> bool:
+        return any(term in normalized_query for term in OFFICIAL_DOC_QUERY_TERMS)
+
+    def _doc_source_boost(self, normalized_query: str, doc: Document) -> tuple[float, str]:
+        source_type = self._doc_source_type(doc)
+        if self._is_official_doc_query(normalized_query):
+            if source_type in {"web", "bibliotheque"}:
+                boost = OFFICIAL_DOC_NONFAQ_RERANK_BOOST
+                mode = "official_nonfaq"
+                if source_type == "bibliotheque":
+                    boost += OFFICIAL_DOC_BIBLIOTHEQUE_EXTRA_BOOST
+                    mode = "official_bibliotheque"
+                return boost, mode
+            if source_type == "faq":
+                return OFFICIAL_DOC_FAQ_RERANK_PENALTY, "official_faq_penalty"
+            return 0.0, "official_neutral"
+
+        if source_type == "faq":
+            return FAQ_RERANK_BOOST, "faq_default"
+        return 0.0, "neutral"
+
+    def _doc_source_tiebreaker(self, normalized_query: str, doc: Document) -> int:
+        source_type = self._doc_source_type(doc)
+        if self._is_official_doc_query(normalized_query):
+            if source_type == "bibliotheque":
+                return 3
+            if source_type == "web":
+                return 2
+            if source_type == "faq":
+                return 1
+            return 0
         if source_type == "faq":
             return 3
         if source_type == "web":
@@ -447,22 +498,29 @@ CONTEXTE DOCUMENTAIRE:
         pairs = [(query, doc.page_content[:600]) for doc in candidates]
         try:
             raw_scores = self.shared_reranker.predict(pairs).tolist()
+            normalized_query = self._normalize_text(query)
             ranked = sorted(
                 (
                     (
-                        score + (FAQ_RERANK_BOOST if self._doc_priority(doc) >= 3 else 0.0),
+                        score + boost,
                         score,
+                        boost,
+                        mode,
+                        self._doc_source_tiebreaker(normalized_query, doc),
                         doc,
                     )
                     for score, doc in zip(raw_scores, candidates)
+                    for boost, mode in [self._doc_source_boost(normalized_query, doc)]
                 ),
-                key=lambda item: item[0],
+                key=lambda item: (item[0], item[4], item[1]),
                 reverse=True,
             )
             top_docs = []
-            for rank, (score, raw_score, doc) in enumerate(ranked[: self.final_k], start=1):
+            for rank, (score, raw_score, boost, mode, _, doc) in enumerate(ranked[: self.final_k], start=1):
                 doc.metadata["vespa_rerank_score"] = float(score)
                 doc.metadata["vespa_rerank_raw_score"] = float(raw_score)
+                doc.metadata["vespa_rerank_source_boost"] = float(boost)
+                doc.metadata["vespa_rerank_mode"] = mode
                 doc.metadata["vespa_rerank_rank"] = rank
                 top_docs.append(doc)
             logger.info(
@@ -477,14 +535,17 @@ CONTEXTE DOCUMENTAIRE:
             return candidates[: self.final_k]
 
     def _retrieve_docs_vespa(self, query: str, query_embedding: list[float], org: str = "all") -> list[Document]:
+        candidate_k = self.retrieval_k
+        if self._is_official_doc_query(self._normalize_text(query)):
+            candidate_k = max(candidate_k, OFFICIAL_DOC_RETRIEVE_K)
         hits = query_schema(
             self.vespa,
             schema="doc",
             query_text=query,
             query_embedding=query_embedding,
             org=org,
-            target_hits=self.retrieval_k,
-            hits=self.retrieval_k,
+            target_hits=candidate_k,
+            hits=candidate_k,
         )
         candidates = []
         for index, hit in enumerate(hits, start=1):
