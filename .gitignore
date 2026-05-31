@@ -6,5 +6,10 @@ test/
 logs/
 storage/
 __pycache__/
+UI/node_modules/
+UI/dist/
+UI/vite.err.log
+UI/vite.out.log
 CLAUDE.md
 Agents.md
+shipping/UI

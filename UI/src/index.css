@@ -1,0 +1,275 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    --tw-background: 0 0% 100%;
+    --tw-foreground: 214 28% 15%;
+    --tw-card: 0 0% 100%;
+    --tw-card-foreground: 214 28% 15%;
+    --tw-primary: 86 69% 27%;
+    --tw-primary-foreground: 0 0% 100%;
+    --tw-secondary: 220 14% 96%;
+    --tw-secondary-foreground: 214 20% 22%;
+    --tw-muted: 220 14% 96%;
+    --tw-muted-foreground: 217 13% 45%;
+    --tw-accent: 90 32% 92%;
+    --tw-accent-foreground: 86 69% 22%;
+    --tw-destructive: 4 73% 45%;
+    --tw-destructive-foreground: 0 0% 100%;
+    --tw-border: 85 24% 84%;
+    --tw-input: 214 18% 88%;
+    --tw-ring: 86 69% 27%;
+  }
+
+  * {
+    box-sizing: border-box;
+    border-color: hsl(var(--tw-border));
+  }
+
+  html,
+  body,
+  #root {
+    min-height: 100%;
+  }
+
+  body {
+    margin: 0;
+    min-width: 320px;
+    background: hsl(var(--tw-background));
+    color: hsl(var(--tw-foreground));
+    font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  }
+
+  button,
+  input,
+  select,
+  textarea {
+    font: inherit;
+  }
+
+  a {
+    color: hsl(var(--tw-primary));
+  }
+}
+
+@layer components {
+  .admin-panel {
+    @apply rounded-lg border border-border bg-card p-5 shadow-sm;
+  }
+
+  .admin-panel h2 {
+    @apply mb-4 text-lg font-semibold text-foreground;
+  }
+
+  .panel-heading {
+    @apply mb-4 flex items-center justify-between gap-3;
+  }
+
+  .panel-heading h2 {
+    @apply mb-0;
+  }
+
+  .table-list {
+    @apply grid gap-2;
+  }
+
+  .table-row {
+    @apply grid min-h-14 grid-cols-[minmax(0,1fr)_auto_auto] items-center gap-3 border-t border-border pt-3 text-sm;
+  }
+
+  .table-row span:first-child {
+    @apply grid min-w-0 gap-0.5;
+  }
+
+  .table-row strong,
+  .table-row small {
+    @apply truncate;
+  }
+
+  .table-row small,
+  .empty {
+    @apply text-muted-foreground;
+  }
+
+  .status-pill {
+    @apply inline-flex min-h-7 items-center justify-center rounded-full bg-accent px-3 text-xs font-semibold text-accent-foreground;
+  }
+
+  .metrics {
+    @apply flex flex-wrap gap-3;
+  }
+
+  .metrics span {
+    @apply rounded-lg bg-accent px-4 py-3 text-sm font-semibold text-accent-foreground;
+  }
+
+  .form-error {
+    @apply rounded-md border border-destructive/20 bg-destructive/10 px-4 py-3 text-sm font-medium text-destructive;
+  }
+
+  .resource-card {
+    @apply flex gap-3 rounded-lg border border-border bg-background p-3 text-sm text-foreground no-underline shadow-sm transition hover:border-primary/40 hover:bg-accent/40;
+  }
+
+  .resource-card p {
+    @apply mt-1 text-xs text-muted-foreground;
+  }
+
+  .users-manager {
+    @apply w-full;
+  }
+
+  .users-toolbar {
+    @apply mb-6 grid gap-4;
+    grid-template-columns: minmax(0, 1fr) auto;
+    align-items: end;
+  }
+
+  .users-heading h2 {
+    @apply text-2xl font-semibold leading-tight text-foreground;
+  }
+
+  .users-heading p {
+    @apply mt-2 text-sm text-muted-foreground;
+  }
+
+  .users-actions {
+    @apply flex flex-wrap items-center justify-end gap-3;
+  }
+
+  .users-actions span {
+    @apply text-sm text-muted-foreground;
+  }
+
+  .users-search {
+    @apply relative mb-8 w-full;
+  }
+
+  .users-search-icon {
+    @apply pointer-events-none absolute left-4 top-1/2 h-5 w-5 -translate-y-1/2 text-muted-foreground;
+  }
+
+  .users-search input {
+    @apply h-12 w-full rounded-lg border border-input bg-background pl-12 pr-4 text-sm outline-none transition focus:border-primary focus:ring-2 focus:ring-primary/20;
+  }
+
+  .users-list {
+    @apply grid gap-4;
+  }
+
+  .users-count-footer {
+    @apply mt-6 text-center text-sm text-muted-foreground;
+  }
+
+  .user-card {
+    @apply grid rounded-lg border border-border bg-card p-5 shadow-sm transition-shadow hover:shadow-md;
+    grid-template-columns: 72px minmax(0, 1fr) auto;
+    align-items: start;
+    column-gap: 18px;
+  }
+
+  .user-avatar {
+    @apply flex shrink-0 items-center justify-center rounded-full bg-primary text-2xl font-bold text-primary-foreground;
+    width: 72px;
+    height: 72px;
+  }
+
+  .user-card-body {
+    @apply min-w-0;
+  }
+
+  .user-title-row {
+    @apply flex min-w-0 flex-wrap items-center gap-2;
+  }
+
+  .user-title-row h3 {
+    @apply truncate text-xl font-semibold leading-tight text-foreground;
+  }
+
+  .user-admin-badge {
+    @apply inline-flex items-center gap-1 rounded-md bg-primary/10 px-2.5 py-1 text-xs font-semibold text-primary;
+  }
+
+  .user-meta {
+    @apply mt-4 grid gap-2.5 text-sm text-muted-foreground;
+  }
+
+  .user-meta span {
+    @apply flex min-w-0 items-center gap-2 truncate;
+  }
+
+  .user-meta svg {
+    @apply h-4 w-4 shrink-0;
+  }
+
+  .user-card-actions {
+    @apply flex min-w-[220px] flex-col items-stretch justify-start gap-2;
+  }
+
+  .user-card-actions button {
+    @apply w-full gap-2;
+  }
+
+  .user-delete-button {
+    @apply gap-2 border border-input bg-background text-destructive;
+  }
+}
+
+.user-delete-button:hover {
+  background-color: hsl(var(--tw-destructive) / 0.1) !important;
+  color: hsl(var(--tw-destructive)) !important;
+}
+
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+::-webkit-scrollbar-track {
+  background: hsl(var(--tw-muted));
+}
+
+::-webkit-scrollbar-thumb {
+  background: hsl(var(--tw-muted-foreground) / 0.35);
+  border-radius: 999px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: hsl(var(--tw-muted-foreground) / 0.55);
+}
+
+@media (max-width: 700px) {
+  .table-row {
+    @apply grid-cols-1;
+  }
+
+  .users-toolbar {
+    grid-template-columns: 1fr;
+  }
+
+  .users-actions {
+    @apply justify-start;
+  }
+
+  .user-card {
+    grid-template-columns: 56px minmax(0, 1fr);
+    row-gap: 16px;
+  }
+
+  .user-avatar {
+    width: 56px;
+    height: 56px;
+    @apply text-xl;
+  }
+
+  .user-card-actions {
+    grid-column: 1 / -1;
+    @apply min-w-0 flex-row justify-start;
+  }
+
+  .user-card-actions button {
+    @apply w-auto;
+  }
+}
