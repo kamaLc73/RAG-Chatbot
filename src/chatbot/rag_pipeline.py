@@ -924,10 +924,44 @@ CONTEXTE DOCUMENTAIRE:
         words = normalized.strip().split()
         if len(words) > 8:
             return False
+        return self._has_resource_signal(query, resource)
+
+    def _has_resource_signal(self, query: str, resource: str) -> bool:
+        normalized = self._normalize_text(query)
         if resource == "video":
-            return any(token in normalized for token in (" video ", " videos ", " youtube "))
+            return any(
+                token in normalized
+                for token in (
+                    " video ",
+                    " videos ",
+                    " youtube ",
+                    " tutoriel video ",
+                    " en video ",
+                    " voir une video ",
+                    " regarder une video ",
+                )
+            )
         if resource == "form":
-            return any(token in normalized for token in (" formulaire ", " formulaires ", " imprimes ", " imprime "))
+            return any(
+                token in normalized
+                for token in (
+                    "demande",
+                    " formulaire ",
+                    " formulaires ",
+                    " imprimes ",
+                    " imprime ",
+                    " pdf ",
+                    " telecharger ",
+                    " document a remplir ",
+                    " documents a remplir ",
+                    " dossier a remplir ",
+                    " dossier de demande ",
+                    " papier a remplir ",
+                    " papiers a fournir ",
+                    " pieces a fournir ",
+                    " documents a fournir ",
+                )
+            )
         return False
 
     def _classify_intent(self, query: str) -> dict:
@@ -1009,18 +1043,19 @@ CONTEXTE DOCUMENTAIRE:
         return any(term in normalized for term in obvious_outside_terms)
 
     def _should_run_auxiliary_retriever(self, classification: dict, kind: str, query: str) -> bool:
+        has_signal = self._has_resource_signal(query, kind)
         if self.intent_classifier is None or not self.intent_classifier.is_loaded:
-            return True
+            return has_signal
 
         confidence = float(classification.get("confidence", 0.0) or 0.0)
         threshold = getattr(self.intent_classifier, "gate_confidence_threshold", 0.60)
-        if classification.get("intent") == "retrieval" and confidence < threshold:
-            return self._is_resource_only_query(query, kind)
+        if confidence < threshold:
+            return False
 
         if kind == "video":
-            return self.intent_classifier.should_retrieve_videos(classification)
+            return has_signal and self.intent_classifier.should_retrieve_videos(classification)
         if kind == "form":
-            return self.intent_classifier.should_retrieve_forms(classification)
+            return has_signal and self.intent_classifier.should_retrieve_forms(classification)
         return False
 
     def query(
