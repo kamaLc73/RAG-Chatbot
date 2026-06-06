@@ -10,7 +10,6 @@ interface LoginPayload {
 
 interface SignupPayload extends LoginPayload {
   name: string;
-  organization?: string;
 }
 
 export async function login(payload: LoginPayload) {

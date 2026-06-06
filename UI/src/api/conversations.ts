@@ -12,6 +12,13 @@ export async function createConversation(organization: Organization) {
   });
 }
 
+export async function updateConversationTitle(id: string, title: string) {
+  return apiRequest<Conversation>(`/conversations/${id}`, {
+    method: 'PATCH',
+    body: JSON.stringify({ title }),
+  });
+}
+
 export async function deleteConversation(id: string) {
   return apiRequest<void>(`/conversations/${id}`, { method: 'DELETE' });
 }

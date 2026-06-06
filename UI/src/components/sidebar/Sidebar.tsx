@@ -1,6 +1,6 @@
 import { Plus, X } from 'lucide-react';
 import { useEffect, useMemo } from 'react';
-import { deleteConversation } from '../../api/conversations';
+import { deleteConversation, updateConversationTitle } from '../../api/conversations';
 import { useChat } from '../../contexts/ChatContext';
 import TypeSelector from '../chat/TypeSelector';
 import Button from '../ui/Button';
@@ -49,6 +49,11 @@ export default function Sidebar({ isOpen, onClose }: SidebarProps) {
     await refreshConversations();
   };
 
+  const handleRenameConversation = async (conversationId: string, title: string) => {
+    await updateConversationTitle(conversationId, title);
+    await refreshConversations();
+  };
+
   const renderGroup = (title: string, items: typeof filteredConversations) => {
     if (items.length === 0) return null;
 
@@ -63,6 +68,7 @@ export default function Sidebar({ isOpen, onClose }: SidebarProps) {
               isActive={activeConversationId === conversation.id}
               onClick={() => void handleSelectConversation(conversation.id)}
               onDelete={(id) => void handleDeleteConversation(id)}
+              onRename={(id, title) => void handleRenameConversation(id, title)}
             />
           ))}
         </div>
@@ -76,12 +82,12 @@ export default function Sidebar({ isOpen, onClose }: SidebarProps) {
 
       <aside
         className={cn(
-          'fixed inset-y-0 left-0 z-50 flex w-72 flex-col border-r border-primary/20 bg-background shadow-md transition-transform duration-300 ease-in-out md:static md:w-1/4 md:translate-x-0',
+          'fixed inset-y-0 left-0 z-50 flex w-[min(20rem,calc(100vw-2rem))] flex-col border-r border-primary/20 bg-background shadow-md transition-transform duration-300 ease-in-out md:static md:w-[18rem] md:translate-x-0 lg:w-[20rem] xl:w-[22rem]',
           isOpen ? 'translate-x-0' : '-translate-x-full'
         )}
         aria-label="Conversations"
       >
-        <div className="space-y-3 border-b border-border p-4">
+        <div className="space-y-3 border-b border-border p-3 sm:p-4">
           <div className="flex items-center justify-between">
             <h2 className="font-semibold">Conversations</h2>
             <Button variant="ghost" size="sm" onClick={onClose} className="md:hidden" aria-label="Fermer la barre latérale">
@@ -103,7 +109,7 @@ export default function Sidebar({ isOpen, onClose }: SidebarProps) {
           </button>
         </div>
 
-        <div className="flex-1 overflow-y-auto p-4">
+        <div className="flex-1 overflow-y-auto p-3 sm:p-4">
           {filteredConversations.length === 0 ? (
             <div className="py-8 text-center">
               <p className="text-sm text-muted-foreground">Aucune conversation pour le moment</p>

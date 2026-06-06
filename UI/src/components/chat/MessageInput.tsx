@@ -151,9 +151,9 @@ export default function MessageInput({ disabled, placeholder = 'Posez une questi
   };
 
   return (
-    <div className="p-4">
-      <div className="rounded-lg border border-primary/20 bg-background p-3 shadow-sm">
-        <div className="grid grid-cols-[auto_minmax(0,1fr)_auto] items-stretch gap-3">
+    <div className="p-3 sm:p-4">
+      <div className="rounded-lg border border-primary/20 bg-background p-2 shadow-sm sm:p-3">
+        <div className="grid grid-cols-[auto_minmax(0,1fr)_auto] items-stretch gap-2 sm:gap-3">
           <Button
             variant={isRecording ? 'destructive' : 'outline'}
             type="button"
@@ -161,7 +161,7 @@ export default function MessageInput({ disabled, placeholder = 'Posez une questi
             aria-label={isRecording ? "Arrêter l'enregistrement" : 'Enregistrer avec le microphone'}
             onClick={toggleRecording}
             disabled={(!isRecording && disabled) || isTranscribing}
-            className="h-full w-14 p-0"
+            className="h-full w-12 p-0 sm:w-14"
           >
             {isTranscribing ? (
               <Loader2 className="h-5 w-5 animate-spin" />
@@ -189,11 +189,11 @@ export default function MessageInput({ disabled, placeholder = 'Posez une questi
             }}
             disabled={disabled}
           />
-          <Button type="button" onClick={submit} disabled={disabled || !message.trim()} aria-label="Envoyer" className="h-full w-14 p-0">
+          <Button type="button" onClick={submit} disabled={disabled || !message.trim()} aria-label="Envoyer" className="h-full w-12 p-0 sm:w-14">
             <Send className="h-5 w-5" />
           </Button>
         </div>
-        <p className="mt-3 text-xs text-muted-foreground">
+        <p className="mt-3 break-words text-xs text-muted-foreground">
           {isRecording
             ? "Enregistrement en cours... cliquez sur le carré pour arrêter."
             : isTranscribing

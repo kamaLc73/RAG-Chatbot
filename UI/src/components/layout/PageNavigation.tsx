@@ -23,7 +23,7 @@ export default function PageNavigation({ className = '' }: PageNavigationProps) 
         variant={location.pathname.startsWith('/chat') ? 'primary' : 'outline'}
         size="sm"
         onClick={() => navigate('/chat')}
-        className="gap-2"
+        className="gap-2 whitespace-nowrap"
       >
         <MessageSquare className="h-4 w-4" />
         Chat
@@ -33,13 +33,13 @@ export default function PageNavigation({ className = '' }: PageNavigationProps) 
           variant={location.pathname.startsWith('/admin') ? 'primary' : 'outline'}
           size="sm"
           onClick={() => navigate('/admin')}
-          className="gap-2"
+          className="gap-2 whitespace-nowrap"
         >
           <Shield className="h-4 w-4" />
           Admin
         </Button>
       )}
-      <Button variant="outline" size="sm" onClick={handleLogout} className="gap-2 text-destructive hover:text-destructive">
+      <Button variant="outline" size="sm" onClick={handleLogout} className="logout-button whitespace-nowrap">
         <LogOut className="h-4 w-4" />
         Se déconnecter
       </Button>

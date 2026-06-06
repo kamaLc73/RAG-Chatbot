@@ -1,4 +1,84 @@
+x-api-build: &api-build
+  context: .
+  dockerfile: Dockerfile.api
+
+x-api-environment: &api-environment
+  DATABASE_URL: postgresql+asyncpg://chatbot:chatbot_pass@postgres:5432/chatbot_db
+  FRONTEND_URL: http://localhost:5173
+  API_CORS_ORIGINS: http://localhost:5173,http://127.0.0.1:5173,http://localhost:3000,http://127.0.0.1:3000
+  JWT_SECRET_KEY: ${JWT_SECRET_KEY:-change-me-docker-local}
+  JWT_ACCESS_TOKEN_EXPIRE_MINUTES: ${JWT_ACCESS_TOKEN_EXPIRE_MINUTES:-120}
+  API_LOAD_RAG_ON_STARTUP: ${API_LOAD_RAG_ON_STARTUP:-true}
+  API_LOAD_AUDIO_ON_STARTUP: ${API_LOAD_AUDIO_ON_STARTUP:-true}
+  API_AUDIO_MODEL_SIZE: ${API_AUDIO_MODEL_SIZE:-small}
+  API_AUDIO_LANGUAGE: ${API_AUDIO_LANGUAGE:-fr}
+  API_BOOTSTRAP_SUPERUSER_EMAIL: ${API_BOOTSTRAP_SUPERUSER_EMAIL:-}
+  API_BOOTSTRAP_SUPERUSER_USERNAME: ${API_BOOTSTRAP_SUPERUSER_USERNAME:-}
+  API_BOOTSTRAP_SUPERUSER_FULL_NAME: ${API_BOOTSTRAP_SUPERUSER_FULL_NAME:-Admin local}
+  API_BOOTSTRAP_SUPERUSER_PASSWORD: ${API_BOOTSTRAP_SUPERUSER_PASSWORD:-}
+  CACHE_BACKEND: redis
+  REDIS_URL: redis://redis:6379/0
+  CACHE_KEY_PREFIX: ${CACHE_KEY_PREFIX:-rag-chatbot:}
+  VESPA_URL: http://vespa
+  VESPA_PORT: 8080
+  VESPA_CONTENT_CLUSTER: rcar_cnra
+  OLLAMA_BASE_URL: ${DOCKER_OLLAMA_BASE_URL:-http://host.docker.internal:11434}
+  OLLAMA_MODEL: ${OLLAMA_MODEL:-mistral:latest}
+
+x-api-volumes: &api-volumes
+  - ./data:/app/data
+  - ./logs:/app/logs
+  - hf_cache:/root/.cache/huggingface
+  - torch_cache:/root/.cache/torch
+  - whisper_cache:/root/.cache/whisper
+
 services:
+  api:
+    build: *api-build
+    image: rag-chatbot-api:local
+    container_name: rag-chatbot-api
+    environment:
+      <<: *api-environment
+      NVIDIA_VISIBLE_DEVICES: all
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
+    ports:
+      - "8000:8000"
+    volumes: *api-volumes
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      vespa:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8000/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 20
+    gpus: all
+
+  ui:
+    build:
+      context: ./UI
+      dockerfile: Dockerfile
+      args:
+        VITE_API_URL: ${DOCKER_VITE_API_URL:-http://localhost:8000}
+    image: rag-chatbot-ui:local
+    container_name: rag-chatbot-ui
+    ports:
+      - "5173:80"
+    depends_on:
+      api:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+
   vespa:
     image: vespaengine/vespa:latest
     container_name: vespa
@@ -36,6 +116,53 @@ services:
       timeout: 3s
       retries: 10
 
+  redis:
+    image: redis:7-alpine
+    container_name: redis
+    ports:
+      - "6380:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  index-docs:
+    profiles: ["index"]
+    build: *api-build
+    image: rag-chatbot-api:local
+    environment: *api-environment
+    volumes: *api-volumes
+    command: ["python", "src/chatbot/index_data.py"]
+    depends_on:
+      vespa:
+        condition: service_healthy
+
+  index-forms:
+    profiles: ["index"]
+    build: *api-build
+    image: rag-chatbot-api:local
+    environment: *api-environment
+    volumes: *api-volumes
+    command: ["python", "src/forms/index_forms.py"]
+    depends_on:
+      vespa:
+        condition: service_healthy
+
+  index-videos:
+    profiles: ["index"]
+    build: *api-build
+    image: rag-chatbot-api:local
+    environment: *api-environment
+    volumes: *api-volumes
+    command: ["python", "src/youtube/index_videos.py"]
+    depends_on:
+      vespa:
+        condition: service_healthy
+
 volumes:
   vespa_data:
   postgres_data:
+  hf_cache:
+  torch_cache:
+  whisper_cache:

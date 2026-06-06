@@ -132,7 +132,6 @@ def evaluate_intents(args: argparse.Namespace) -> dict[str, Any]:
             classification = {
                 "intent": "error",
                 "confidence": 0.0,
-                "tier": 0,
                 "reasoning": error,
                 "loaded": False,
             }
@@ -155,7 +154,6 @@ def evaluate_intents(args: argparse.Namespace) -> dict[str, Any]:
             "predicted_intent": predicted_intent,
             "intent_correct": expected_intent == predicted_intent,
             "confidence": float(classification.get("confidence") or 0.0),
-            "tier": classification.get("tier"),
             "reasoning": classification.get("reasoning", ""),
             "loaded": bool(classification.get("loaded", False)),
             "expected_video_gate": _bool_label(expected_video_gate),

@@ -1,6 +1,7 @@
-import { createContext, useCallback, useContext, useMemo, useState, type ReactNode } from 'react';
+import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import * as chatApi from '../api/chat';
 import * as conversationsApi from '../api/conversations';
+import { useAuth } from './AuthContext';
 import type { ChatMessage, Conversation, Organization } from '../api/types';
 
 interface ChatContextValue {
@@ -15,21 +16,31 @@ interface ChatContextValue {
   startConversation: () => Promise<void>;
   selectConversation: (id: string) => Promise<void>;
   sendMessage: (content: string) => Promise<void>;
+  updateMessageFeedback: (messageId: string, feedback: 1 | -1 | null) => void;
 }
 
 const ChatContext = createContext<ChatContextValue | undefined>(undefined);
 
-function localMessage(role: ChatMessage['role'], content: string, resources: ChatMessage['resources'] = []): ChatMessage {
+function localMessage(
+  role: ChatMessage['role'],
+  content: string,
+  resources: ChatMessage['resources'] = [],
+  patch: Partial<ChatMessage> = {}
+): ChatMessage {
   return {
     id: crypto.randomUUID(),
     role,
     content,
     resources,
     created_at: new Date().toISOString(),
+    ...patch,
   };
 }
 
 export function ChatProvider({ children }: { children: ReactNode }) {
+  const { user } = useAuth();
+  const currentUserId = user?.id ?? null;
+  const activeUserIdRef = useRef<string | null>(currentUserId);
   const [organization, setOrganization] = useState<Organization>('CNRA & RCAR');
   const [conversations, setConversations] = useState<Conversation[]>([]);
   const [activeConversationId, setActiveConversationId] = useState<string>();
@@ -49,12 +60,37 @@ export function ChatProvider({ children }: { children: ReactNode }) {
   );
 
   const refreshConversations = useCallback(async () => {
-    try {
-      setConversations(await conversationsApi.listConversations());
-    } catch (err) {
-      setError(err instanceof Error ? err.message : 'Unable to load conversations');
+    if (!currentUserId) {
+      setConversations([]);
+      return;
     }
-  }, []);
+
+    const requestUserId = currentUserId;
+    try {
+      const nextConversations = await conversationsApi.listConversations();
+      if (activeUserIdRef.current === requestUserId) {
+        setConversations(nextConversations);
+      }
+    } catch (err) {
+      if (activeUserIdRef.current === requestUserId) {
+        setError(err instanceof Error ? err.message : 'Impossible de charger les conversations');
+      }
+    }
+  }, [currentUserId]);
+
+  useEffect(() => {
+    activeUserIdRef.current = currentUserId;
+    setOrganization('CNRA & RCAR');
+    setConversations([]);
+    setActiveConversationId(undefined);
+    setMessages([]);
+    setError(undefined);
+    setIsSending(false);
+
+    if (currentUserId) {
+      void refreshConversations();
+    }
+  }, [currentUserId, refreshConversations]);
 
   const startConversation = useCallback(async () => {
     const conversation = await conversationsApi.createConversation(organization);
@@ -82,9 +118,15 @@ export function ChatProvider({ children }: { children: ReactNode }) {
         setActiveConversationId(response.conversation_id);
         setMessages((current) => [
           ...current,
-          localMessage('assistant', response.answer, response.resources ?? []),
+          localMessage('assistant', response.answer, response.resources ?? [], {
+            id: response.message_id ?? crypto.randomUUID(),
+            context_docs: response.context_docs,
+            latency_seconds: response.latency_seconds,
+          }),
         ]);
         void refreshConversations();
+        window.setTimeout(() => void refreshConversations(), 3000);
+        window.setTimeout(() => void refreshConversations(), 9000);
       } catch (err) {
         const message = err instanceof Error ? err.message : 'Unable to send message';
         setError(message);
@@ -95,6 +137,12 @@ export function ChatProvider({ children }: { children: ReactNode }) {
     },
     [activeConversationId, organization, refreshConversations]
   );
+
+  const updateMessageFeedback = useCallback((messageId: string, feedback: 1 | -1 | null) => {
+    setMessages((current) =>
+      current.map((message) => (message.id === messageId ? { ...message, feedback } : message))
+    );
+  }, []);
 
   const value = useMemo(
     () => ({
@@ -109,6 +157,7 @@ export function ChatProvider({ children }: { children: ReactNode }) {
       startConversation,
       selectConversation,
       sendMessage,
+      updateMessageFeedback,
     }),
     [
       organization,
@@ -122,6 +171,7 @@ export function ChatProvider({ children }: { children: ReactNode }) {
       startConversation,
       selectConversation,
       sendMessage,
+      updateMessageFeedback,
     ]
   );
 

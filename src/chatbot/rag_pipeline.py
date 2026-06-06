@@ -434,6 +434,15 @@ CONTEXTE DOCUMENTAIRE:
             return {**payload, **self._context_payload(docs)}
         return payload
 
+    @staticmethod
+    def _has_context_payload(payload: dict) -> bool:
+        return isinstance(payload.get("context_items"), list) or isinstance(payload.get("contexts"), list)
+
+    def _cache_payload(self, payload: dict, docs: list[Document], include_contexts: bool) -> dict:
+        if include_contexts:
+            return {**payload, **self._context_payload(docs)}
+        return payload
+
     def _cache_get(self, key: str) -> dict | None:
         entry = self.response_cache.get(key)
         if entry:
@@ -968,7 +977,6 @@ CONTEXTE DOCUMENTAIRE:
         classification = {
             "intent": "retrieval",
             "confidence": 0.0,
-            "tier": 1,
             "reasoning": "IntentClassifier disabled"
             if not self.enable_intent_classifier
             else "IntentClassifier unavailable",
@@ -979,9 +987,8 @@ CONTEXTE DOCUMENTAIRE:
             try:
                 classification = self.intent_classifier.classify(query)
                 logger.info(
-                    "Intent: {} [tier {}] conf={:.3f}",
+                    "Intent: {} conf={:.3f}",
                     classification.get("intent", "retrieval"),
-                    classification.get("tier", 1),
                     classification.get("confidence", 0.0),
                 )
             except Exception as exc:
@@ -1065,6 +1072,7 @@ CONTEXTE DOCUMENTAIRE:
         include_contexts: bool = False,
         use_intent_classifier: bool = True,
     ) -> dict:
+        query_started_at = time.perf_counter()
         cleaned = (query or "").strip()
         if not cleaned:
             return self._error_response("Veuillez saisir une question.", query)
@@ -1078,14 +1086,15 @@ CONTEXTE DOCUMENTAIRE:
         cache_key = f"{org}:{mode}:{cleaned.lower()}"
         if hit := self._cache_get(cache_key):
             payload = {**hit, "original_query": query, "cached": True}
+            timings = dict(payload.get("timings") or {})
+            timings["cache_hit_seconds"] = round(time.perf_counter() - query_started_at, 6)
+            payload["timings"] = timings
             if include_contexts:
-                try:
-                    query_embedding = self.embeddings.embed_query(cleaned)
-                    docs = self._retrieve_docs_vespa(cleaned, query_embedding, org=org)
-                    payload = self._maybe_attach_contexts(payload, docs, include_contexts=True)
-                    payload["context_docs"] = len(docs)
-                except Exception as exc:
-                    logger.warning("Impossible de recuperer les contextes pour cache hit: {}", exc)
+                if self._has_context_payload(payload):
+                    context_items = payload.get("context_items")
+                    if isinstance(context_items, list):
+                        payload["context_docs"] = len(context_items)
+                else:
                     payload = {**payload, "contexts": [], "context_metadata": [], "context_items": []}
             return payload
 
@@ -1122,9 +1131,69 @@ CONTEXTE DOCUMENTAIRE:
             classification = {
                 "intent": "retrieval",
                 "confidence": 1.0,
-                "tier": 0,
                 "reasoning": "intent classifier disabled",
             }
+
+        run_videos = use_intent_classifier and self._should_run_auxiliary_retriever(classification, "video", cleaned)
+        run_forms = use_intent_classifier and self._should_run_auxiliary_retriever(classification, "form", cleaned)
+        resource_only_video = use_intent_classifier and self._is_resource_only_query(cleaned, "video")
+        resource_only_form = use_intent_classifier and self._is_resource_only_query(cleaned, "form")
+
+        if resource_only_video or resource_only_form:
+            t_aux = time.perf_counter()
+            videos, forms = [], []
+            timings = {}
+            try:
+                t_embed = time.perf_counter()
+                query_embedding = self.embeddings.embed_query(cleaned)
+                timings["embedding_seconds"] = round(time.perf_counter() - t_embed, 6)
+                t_resources = time.perf_counter()
+                if resource_only_video and run_videos:
+                    videos = self._retrieve_videos(cleaned, query_embedding, org)
+                if resource_only_form and run_forms:
+                    forms = self._retrieve_forms(cleaned, query_embedding, org)
+                timings["resources_retrieval_seconds"] = round(time.perf_counter() - t_resources, 6)
+                logger.info(
+                    "Retrieval Vespa resources-only: videos={} (gate={}) formulaires={} (gate={}) en {:.3f}s",
+                    len(videos),
+                    "ON" if run_videos else "OFF",
+                    len(forms),
+                    "ON" if run_forms else "OFF",
+                    time.perf_counter() - t_aux,
+                )
+            except Exception as exc:
+                logger.error("Erreur retrieval ressources Vespa: {}", exc)
+                return self._error_response("Erreur lors de la recherche de ressources.", query)
+
+            if resource_only_video:
+                response = (
+                    "Des videos pertinentes sont affichees ci-dessous."
+                    if videos
+                    else "Aucune video pertinente n'a ete trouvee dans la base documentaire."
+                )
+                intent = classification.get("intent", "needs_video")
+            else:
+                response = (
+                    "Les formulaires pertinents sont affiches ci-dessous."
+                    if forms
+                    else "Aucun formulaire pertinent n'a ete trouve dans la base documentaire."
+                )
+                intent = classification.get("intent", "needs_form")
+
+            payload = {
+                "response": response,
+                "context_docs": 0,
+                "videos": videos,
+                "forms": forms,
+                "intent": intent,
+                "intent_confidence": classification.get("confidence", 0.0),
+                "org": org,
+            }
+            timings["total_seconds"] = round(time.perf_counter() - query_started_at, 6)
+            payload["timings"] = timings
+            cache_payload = self._cache_payload(payload, [], include_contexts)
+            self._cache_set(cache_key, cache_payload)
+            return {**cache_payload, "original_query": query, "cached": False}
 
         if self.collection_count == 0:
             return self._error_response(
@@ -1133,10 +1202,17 @@ CONTEXTE DOCUMENTAIRE:
             )
 
         t0 = time.perf_counter()
+        timings = {}
         try:
+            t_embed = time.perf_counter()
             query_embedding = self.embeddings.embed_query(cleaned)
+            timings["embedding_seconds"] = round(time.perf_counter() - t_embed, 6)
+            t_docs = time.perf_counter()
             docs = self._retrieve_docs_vespa(cleaned, query_embedding, org=org)
+            timings["docs_retrieval_seconds"] = round(time.perf_counter() - t_docs, 6)
+            t_context = time.perf_counter()
             context = self._build_context(docs)
+            timings["context_build_seconds"] = round(time.perf_counter() - t_context, 6)
             logger.info(
                 "Retrieval Vespa docs: {} chunks (org={}) en {:.3f}s",
                 len(docs),
@@ -1151,14 +1227,13 @@ CONTEXTE DOCUMENTAIRE:
             return self._error_response("Aucun passage pertinent trouve.", query, context_docs=0)
 
         videos, forms = [], []
-        run_videos = use_intent_classifier and self._should_run_auxiliary_retriever(classification, "video", cleaned)
-        run_forms = use_intent_classifier and self._should_run_auxiliary_retriever(classification, "form", cleaned)
 
         t_aux = time.perf_counter()
         if run_videos:
             videos = self._retrieve_videos(cleaned, query_embedding, org)
         if run_forms:
             forms = self._retrieve_forms(cleaned, query_embedding, org)
+        timings["resources_retrieval_seconds"] = round(time.perf_counter() - t_aux, 6)
         logger.info(
             "Retrieval Vespa: videos={} (gate={}) formulaires={} (gate={}) en {:.3f}s",
             len(videos),
@@ -1178,9 +1253,11 @@ CONTEXTE DOCUMENTAIRE:
                 "intent_confidence": classification.get("confidence", 0.0),
                 "org": org,
             }
-            self._cache_set(cache_key, payload)
-            result = {**payload, "original_query": query, "cached": False}
-            return self._maybe_attach_contexts(result, docs, include_contexts)
+            timings["total_seconds"] = round(time.perf_counter() - query_started_at, 6)
+            payload["timings"] = timings
+            cache_payload = self._cache_payload(payload, docs, include_contexts)
+            self._cache_set(cache_key, cache_payload)
+            return {**cache_payload, "original_query": query, "cached": False}
 
         if forms and self._is_resource_only_query(cleaned, "form"):
             payload = {
@@ -1192,9 +1269,11 @@ CONTEXTE DOCUMENTAIRE:
                 "intent_confidence": classification.get("confidence", 0.0),
                 "org": org,
             }
-            self._cache_set(cache_key, payload)
-            result = {**payload, "original_query": query, "cached": False}
-            return self._maybe_attach_contexts(result, docs, include_contexts)
+            timings["total_seconds"] = round(time.perf_counter() - query_started_at, 6)
+            payload["timings"] = timings
+            cache_payload = self._cache_payload(payload, docs, include_contexts)
+            self._cache_set(cache_key, cache_payload)
+            return {**cache_payload, "original_query": query, "cached": False}
 
         t1 = time.perf_counter()
         try:
@@ -1208,7 +1287,8 @@ CONTEXTE DOCUMENTAIRE:
                     }
                 )
             ).strip()
-            logger.info("Generation: {:.3f}s | {} chars", time.perf_counter() - t1, len(response))
+            timings["generation_seconds"] = round(time.perf_counter() - t1, 6)
+            logger.info("Generation: {:.3f}s | {} chars", timings["generation_seconds"], len(response))
         except Exception as exc:
             logger.error("Erreur generation: {}", exc)
             return self._error_response(
@@ -1230,9 +1310,11 @@ CONTEXTE DOCUMENTAIRE:
             "intent_confidence": classification.get("confidence", 0.0),
             "org": org,
         }
-        self._cache_set(cache_key, payload)
-        result = {**payload, "original_query": query, "cached": False}
-        return self._maybe_attach_contexts(result, docs, include_contexts)
+        timings["total_seconds"] = round(time.perf_counter() - query_started_at, 6)
+        payload["timings"] = timings
+        cache_payload = self._cache_payload(payload, docs, include_contexts)
+        self._cache_set(cache_key, cache_payload)
+        return {**cache_payload, "original_query": query, "cached": False}
 
 
 if __name__ == "__main__":

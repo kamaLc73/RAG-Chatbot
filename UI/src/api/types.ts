@@ -22,9 +22,26 @@ export interface AuthResponse {
 export interface Conversation {
   id: string;
   title: string;
+  title_source?: 'auto_pending' | 'auto_generating' | 'auto' | 'user' | string;
+  title_generated_at?: string | null;
   organization: Organization;
+  org?: 'cnra' | 'rcar' | 'all';
+  created_at?: string;
   updated_at: string;
   user_id?: string | number | null;
+  user_name?: string | null;
+  username?: string | null;
+  user_email?: string | null;
+  message_count?: number;
+  question_count?: number;
+  answer_count?: number;
+  feedback_count?: number;
+  positive_feedback?: number;
+  negative_feedback?: number;
+  avg_latency_seconds?: number | null;
+  total_context_docs?: number;
+  max_context_docs?: number;
+  messages?: ChatMessage[];
 }
 
 export interface Resource {
@@ -45,12 +62,23 @@ export interface ChatMessage {
   content: string;
   created_at: string;
   resources?: Resource[];
+  chunks?: Array<{ text?: string; metadata?: Record<string, unknown> }>;
+  context_docs?: number | null;
+  latency_seconds?: number | null;
+  feedback?: 1 | -1 | null;
+  feedback_comment?: string | null;
+  feedback_at?: string | null;
+  intent?: string | null;
+  intent_confidence?: number | null;
 }
 
 export interface ChatResponse {
   conversation_id: string;
+  message_id?: string;
   answer: string;
   resources?: Resource[];
+  context_docs?: number | null;
+  latency_seconds?: number | null;
 }
 
 export interface AdminStats {

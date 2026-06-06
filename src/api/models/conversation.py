@@ -14,10 +14,11 @@ class Conversation(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
     user_id: Mapped[int | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True)
     title: Mapped[str] = mapped_column(String(255), default="Nouvelle conversation", nullable=False)
+    title_source: Mapped[str] = mapped_column(String(30), default="auto_pending", nullable=False)
+    title_generated_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     org: Mapped[str] = mapped_column(String(20), default="all", nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
 
     user = relationship("User", back_populates="conversations")
     messages = relationship("Message", back_populates="conversation", cascade="all, delete-orphan", order_by="Message.created_at")
-

@@ -143,7 +143,7 @@ export default function UserMenu() {
               <button
                 type="button"
                 onClick={handleLogout}
-                className="flex w-full items-center gap-3 px-4 py-2 text-sm text-foreground transition-colors hover:bg-accent"
+                className="logout-menu-item"
                 role="menuitem"
               >
                 <LogOut className="h-4 w-4" />

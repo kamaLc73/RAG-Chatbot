@@ -23,6 +23,16 @@ def _csv_env(name: str, default: str = "") -> list[str]:
     return [item.strip() for item in value.split(",") if item.strip()]
 
 
+def _float_env(name: str, default: float) -> float:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    try:
+        return float(value)
+    except ValueError:
+        return default
+
+
 @dataclass(frozen=True)
 class Settings:
     app_name: str = os.getenv("API_APP_NAME", "RAG Chatbot API")
@@ -46,6 +56,16 @@ class Settings:
     bootstrap_superuser_username: str = os.getenv("API_BOOTSTRAP_SUPERUSER_USERNAME", "")
     bootstrap_superuser_full_name: str = os.getenv("API_BOOTSTRAP_SUPERUSER_FULL_NAME", "Admin local")
     bootstrap_superuser_password: str = os.getenv("API_BOOTSTRAP_SUPERUSER_PASSWORD", "")
+    cache_backend: str = os.getenv("CACHE_BACKEND", "memory").strip().lower()
+    redis_url: str = os.getenv("REDIS_URL", "redis://localhost:6380/0")
+    cache_key_prefix: str = os.getenv("CACHE_KEY_PREFIX", "rag-chatbot:")
+    redis_socket_timeout_seconds: float = _float_env("REDIS_SOCKET_TIMEOUT_SECONDS", 0.25)
+    redis_connect_timeout_seconds: float = _float_env("REDIS_CONNECT_TIMEOUT_SECONDS", 0.25)
+    redis_retry_after_seconds: float = _float_env("REDIS_RETRY_AFTER_SECONDS", 5.0)
+    clear_admin_cache_on_startup: bool = _bool_env("API_CLEAR_ADMIN_CACHE_ON_STARTUP", False)
+    kb_cache_ttl_seconds: float = _float_env("KB_CACHE_TTL_SECONDS", 21600.0)
+    admin_stats_cache_ttl_seconds: float = _float_env("ADMIN_STATS_CACHE_TTL_SECONDS", 60.0)
+    admin_conversations_cache_ttl_seconds: float = _float_env("ADMIN_CONVERSATIONS_CACHE_TTL_SECONDS", 30.0)
 
     def __post_init__(self) -> None:
         object.__setattr__(

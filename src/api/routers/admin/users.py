@@ -5,6 +5,7 @@ from pydantic import BaseModel
 from sqlalchemy import or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from ...cache import api_cache
 from ...database import get_db
 from ...deps import get_current_superuser
 from ...models import Conversation, User
@@ -72,6 +73,11 @@ def _has_field(payload: BaseModel, field_name: str) -> bool:
     return field_name in fields_set
 
 
+def _invalidate_admin_user_cache() -> None:
+    api_cache.clear("admin:stats")
+    api_cache.clear_prefix("admin:conversations")
+
+
 async def _ensure_unique_user_fields(db: AsyncSession, user_id: int | None, email: str, username: str) -> None:
     result = await db.execute(select(User).where(or_(User.email == email, User.username == username)))
     for existing in result.scalars().all():
@@ -101,6 +107,7 @@ async def create_user(payload: UserCreate, db: AsyncSession = Depends(get_db)) -
     db.add(user)
     await db.commit()
     await db.refresh(user)
+    _invalidate_admin_user_cache()
     return _user_dict(user)
 
 
@@ -124,6 +131,7 @@ async def update_user(user_id: int, payload: UserUpdate, db: AsyncSession = Depe
         user.hashed_password = get_password_hash(payload.password)
     await db.commit()
     await db.refresh(user)
+    _invalidate_admin_user_cache()
     return _user_dict(user)
 
 
@@ -135,6 +143,7 @@ async def set_user_active(user_id: int, is_active: bool, db: AsyncSession = Depe
     user.is_active = is_active
     await db.commit()
     await db.refresh(user)
+    _invalidate_admin_user_cache()
     return _user_dict(user)
 
 
@@ -155,3 +164,4 @@ async def delete_user(
     await db.execute(update(Conversation).where(Conversation.user_id == user.id).values(user_id=None))
     await db.delete(user)
     await db.commit()
+    _invalidate_admin_user_cache()

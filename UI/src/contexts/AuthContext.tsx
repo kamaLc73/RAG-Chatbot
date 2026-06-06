@@ -1,13 +1,13 @@
 import { createContext, useContext, useMemo, useState, type ReactNode } from 'react';
 import { login as loginApi, logout as logoutApi, signup as signupApi } from '../api/auth';
 import { tokenStore } from '../api/client';
-import type { Organization, User } from '../api/types';
+import type { User } from '../api/types';
 
 interface AuthContextValue {
   user: User | null;
   isAuthenticated: boolean;
   login: (payload: { identifier: string; password: string; mode: 'user' | 'admin' }) => Promise<void>;
-  signup: (payload: { name: string; email: string; password: string; organization?: Organization; username?: string }) => Promise<void>;
+  signup: (payload: { name: string; email: string; password: string; username?: string }) => Promise<void>;
   syncUser: (user: User) => void;
   logout: () => void;
 }

@@ -7,11 +7,12 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from loguru import logger as loguru_logger
 
+from .cache import api_cache
 from .config import settings
 from .database import init_db
 from .routers import auth, chat, conversations
 from .routers.admin import conversations as admin_conversations
-from .routers.admin import evaluation, intents, kb, stats, users
+from .routers.admin import evaluation, intents, kb, retrieval, stats, users
 from ..config.logger import is_logger_initialized, setup_logger
 from ..config.settings import LOGS_DIR
 
@@ -44,6 +45,8 @@ async def lifespan(app: FastAPI):
     app.state.rag = None
     app.state.audio_transcriber = None
     await init_db()
+    if settings.clear_admin_cache_on_startup:
+        api_cache.clear_prefix("admin:")
 
     if settings.load_rag_on_startup:
         from src.chatbot.rag_pipeline import RAGPipeline
@@ -79,6 +82,7 @@ app.include_router(admin_conversations.router)
 app.include_router(kb.router)
 app.include_router(intents.router)
 app.include_router(evaluation.router)
+app.include_router(retrieval.router)
 app.include_router(stats.router)
 
 
@@ -89,4 +93,5 @@ def health() -> dict[str, object]:
         "database": "configured",
         "rag_loaded": getattr(app.state, "rag", None) is not None,
         "audio_loaded": getattr(app.state, "audio_transcriber", None) is not None,
+        "cache": api_cache.backend_status(),
     }

@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+﻿import React, { useState } from 'react';
 import {
   Activity,
   ChevronRight,
@@ -13,6 +13,7 @@ import ConversationsManager from '../components/admin/ConversationsManager';
 import EvaluationPanel from '../components/admin/EvaluationPanel';
 import IntentsManager from '../components/admin/IntentsManager';
 import KBManager from '../components/admin/KBManager';
+import RetrievalTestPanel from '../components/admin/RetrievalTestPanel';
 import UsersManager from '../components/admin/UsersManager';
 import PageNavigation from '../components/layout/PageNavigation';
 import type { User } from '../api/types';
@@ -95,18 +96,6 @@ const tabs = [
   },
 ];
 
-function PlaceholderPanel({ title, description }: { title: string; description: string }) {
-  return (
-    <section className="admin-panel">
-      <h2>{title}</h2>
-      <p className="empty">{description}</p>
-      <div className="mt-6 rounded-lg border border-dashed border-border bg-muted/40 p-8 text-center text-sm text-muted-foreground">
-        Point d'accès en attente pour cette première version.
-      </div>
-    </section>
-  );
-}
-
 export default function Admin() {
   const [activeTab, setActiveTab] = useState<AdminTab>('users');
   const [conversationsUser, setConversationsUser] = useState<User | null>(null);
@@ -131,36 +120,11 @@ export default function Admin() {
       case 'conversations':
         return <ConversationsManager selectedUser={conversationsUser} onClearSelectedUser={() => setConversationsUser(null)} />;
       case 'kb-management':
-        return (
-          <div className="space-y-4">
-            <KBManager />
-            <PlaceholderPanel
-              title="Import en masse"
-              description="L'envoi et l'ingestion complète des documents, formulaires et vidéos seront gérés ici."
-            />
-          </div>
-        );
+        return <KBManager />;
       case 'intentions':
-        return (
-          <div className="space-y-4">
-            <IntentsManager />
-            <PlaceholderPanel
-              title="Injections"
-              description="Configuration des protections et des modèles de sécurité liés aux intentions."
-            />
-            <PlaceholderPanel
-              title="Test des intents"
-              description="Interface de test rapide à connecter au classificateur d'intentions."
-            />
-          </div>
-        );
+        return <IntentsManager />;
       case 'retrieval-test':
-        return (
-          <PlaceholderPanel
-            title="Test récupération"
-            description="Console de test de récupération Vespa à connecter aux points d'accès admin."
-          />
-        );
+        return <RetrievalTestPanel />;
       case 'evaluation':
         return <EvaluationPanel />;
       default:
@@ -169,10 +133,10 @@ export default function Admin() {
   };
 
   return (
-    <div className="flex h-screen flex-col bg-background">
-      <header className="bg-card">
-        <div className="mx-auto max-w-7xl border-b border-border px-4 py-4 sm:px-6">
-          <div className="flex flex-col gap-4 sm:grid sm:grid-cols-[1fr_auto_1fr] sm:items-center">
+    <div className="flex h-[100svh] min-w-0 flex-col overflow-hidden bg-background">
+      <header className="shrink-0 bg-card">
+        <div className="mx-auto max-w-7xl border-b border-border px-3 py-3 sm:px-6 sm:py-4">
+          <div className="flex flex-col gap-3 md:grid md:grid-cols-[1fr_auto_1fr] md:items-center">
             <div className="min-w-0">
               <div className="mb-2 flex items-center gap-2 text-sm text-muted-foreground">
                 <Shield className="h-4 w-4" />
@@ -180,22 +144,22 @@ export default function Admin() {
                 <ChevronRight className="h-4 w-4" />
                 <span className="font-medium text-foreground">{currentTab.label}</span>
               </div>
-              <h1 className="text-2xl font-bold text-foreground">Panneau d'administration</h1>
+              <h1 className="text-xl font-bold text-foreground sm:text-2xl">Panneau d'administration</h1>
               <p className="mt-1 text-sm text-muted-foreground">{currentTab.description}</p>
             </div>
-            <div className="flex justify-center">
-              <img src="/prevoyance_logo.png" alt="CDG Prévoyance" className="h-28 w-auto object-contain" />
+            <div className="hidden justify-center md:flex">
+              <img src="/prevoyance_logo.png" alt="CDG Prévoyance" className="h-20 w-auto object-contain lg:h-28" />
             </div>
-            <div className="flex sm:justify-end">
-              <PageNavigation className="flex" />
+            <div className="flex min-w-0 md:justify-end">
+              <PageNavigation className="flex min-w-0 flex-wrap" />
             </div>
           </div>
         </div>
       </header>
 
-      <main className="flex-1 overflow-y-auto">
-        <div className="mx-auto max-w-7xl px-4 py-6 sm:px-6">
-          <div className="mb-8 flex flex-wrap gap-2">
+      <main className="min-h-0 flex-1 overflow-y-auto">
+        <div className="mx-auto max-w-7xl px-3 py-4 sm:px-6 sm:py-6">
+          <div className="mb-6 flex gap-2 overflow-x-auto pb-2 sm:mb-8 sm:flex-wrap sm:overflow-visible sm:pb-0">
             {tabs.map((tab) => {
               const Icon = tab.icon;
               const isActive = activeTab === tab.id;
@@ -206,7 +170,7 @@ export default function Admin() {
                   type="button"
                   onClick={() => selectTab(tab.id)}
                   className={cn(
-                    'inline-flex items-center gap-2 rounded-lg px-4 py-2 text-sm font-semibold transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2',
+                    'inline-flex shrink-0 items-center gap-2 whitespace-nowrap rounded-lg px-3 py-2 text-sm font-semibold transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 sm:px-4',
                     isActive
                       ? 'bg-primary text-primary-foreground shadow-sm'
                       : 'bg-muted text-muted-foreground hover:bg-accent hover:text-accent-foreground'
@@ -229,3 +193,4 @@ export default function Admin() {
     </div>
   );
 }
+

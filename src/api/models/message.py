@@ -19,6 +19,10 @@ class Message(Base):
     intent: Mapped[str | None] = mapped_column(String(80), nullable=True)
     intent_confidence: Mapped[float | None] = mapped_column(Float, nullable=True)
     context_docs: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    latency_seconds: Mapped[float | None] = mapped_column(Float, nullable=True)
+    feedback: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    feedback_comment: Mapped[str | None] = mapped_column(Text, nullable=True)
+    feedback_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     payload_json: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
 

@@ -24,7 +24,7 @@ export default function TypeSelector({ value, onChange, disabled = false }: Type
           title={option.title}
           onClick={() => onChange(option.value)}
           className={cn(
-            'flex-1 rounded-md px-3 py-2 text-sm font-semibold transition-all focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-50',
+            'min-w-0 flex-1 rounded-md px-2 py-2 text-xs font-semibold transition-all focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-50 sm:px-3 sm:text-sm',
             value === option.value
               ? 'bg-primary text-primary-foreground shadow-sm'
               : 'text-muted-foreground hover:bg-background/60 hover:text-foreground'

@@ -24,3 +24,18 @@ export async function transcribeAudio(file: File) {
 export async function getConversationMessages(conversationId: string) {
   return apiRequest<ChatMessage[]>(`/conversations/${conversationId}/messages`);
 }
+
+export async function submitMessageFeedback(messageId: string, feedback: 1 | -1 | null, comment?: string) {
+  return apiRequest<{
+    message_id: string;
+    feedback: 1 | -1 | null;
+    feedback_comment?: string | null;
+    feedback_at?: string | null;
+  }>(
+    `/chat/messages/${messageId}/feedback`,
+    {
+      method: 'POST',
+      body: JSON.stringify({ feedback, comment }),
+    }
+  );
+}

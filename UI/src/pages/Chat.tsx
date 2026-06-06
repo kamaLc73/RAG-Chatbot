@@ -7,7 +7,7 @@ export default function Chat() {
   const [isSidebarOpen, setIsSidebarOpen] = useState(false);
 
   return (
-    <div className="flex h-screen flex-col overflow-hidden bg-background">
+    <div className="flex h-[100svh] min-w-0 flex-col overflow-hidden bg-background">
       <Header onMenuClick={() => setIsSidebarOpen(true)} />
       <div className="flex min-h-0 flex-1 overflow-hidden">
         <Sidebar isOpen={isSidebarOpen} onClose={() => setIsSidebarOpen(false)} />

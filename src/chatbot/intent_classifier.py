@@ -28,14 +28,14 @@ INTENTS_DIR = Path(__file__).resolve().parents[2] / "data" / "intents"
 _STANDALONE_EMBEDDING_MODEL = "BAAI/bge-m3"
 
 # Only keep intents that are actually trained and consumed by the pipeline.
-INTENT_TIERS: Dict[str, int] = {
-    "retrieval": 1,
-    "greeting": 1,
-    "out_of_scope": 1,
-    "negation": 2,
-    "prompt_injection": 3,
-    "needs_form": 4,
-    "needs_video": 4,
+SUPPORTED_INTENTS = {
+    "retrieval",
+    "greeting",
+    "out_of_scope",
+    "negation",
+    "prompt_injection",
+    "needs_form",
+    "needs_video",
 }
 
 VIDEO_RETRIEVER_INTENTS = {"needs_video"}
@@ -212,19 +212,22 @@ class IntentClassifier:
         self,
         shared_embeddings: Optional[Any] = None,
         intents_dir: Path = INTENTS_DIR,
+        examples_by_intent: Optional[Dict[str, List[str]]] = None,
         top_k: int = TOP_K,
         gate_confidence_threshold: float = GATE_CONFIDENCE_THRESHOLD,
     ) -> None:
         self._shared_embeddings_provided: bool = shared_embeddings is not None
         self.embeddings = shared_embeddings
         self.intents_dir = intents_dir
+        self.examples_by_intent = examples_by_intent
         self.top_k = top_k
         self.gate_confidence_threshold = gate_confidence_threshold
 
         self.example_embeddings: Optional[np.ndarray] = None
         self.example_labels: List[str] = []
         self.example_texts: List[str] = []
-        self.intent_tier_map: Dict[str, int] = {}
+        self.exact_example_intents: Dict[str, str] = {}
+        self.active_intents: set[str] = set()
         self._loaded = False
 
         self._load_examples()
@@ -250,11 +253,13 @@ class IntentClassifier:
     def has_domain_signal(self, query: str) -> bool:
         return self._contains_any(self._normalize_query(query), DOMAIN_TERMS)
 
-    def _rule_result(self, intent: str, confidence: float, reason: str) -> Dict[str, Any]:
+    def _rule_result(self, intent: str, confidence: float, reason: str) -> Optional[Dict[str, Any]]:
+        if intent not in self.active_intents:
+            logger.debug("IntentClassifier rule ignoree: intent '{}' inactif ou non charge", intent)
+            return None
         return {
             "intent": intent,
             "confidence": confidence,
-            "tier": self.intent_tier_map.get(intent, INTENT_TIERS.get(intent, 1)),
             "reasoning": reason,
             "loaded": True,
         }
@@ -320,6 +325,10 @@ class IntentClassifier:
     def _load_examples(self) -> None:
         start = time.perf_counter()
 
+        if self.examples_by_intent is not None:
+            self._load_examples_from_mapping(start)
+            return
+
         if not self.intents_dir.exists():
             logger.warning("IntentClassifier: dossier intents introuvable: {}", self.intents_dir)
             return
@@ -334,7 +343,7 @@ class IntentClassifier:
                 logger.debug("IntentClassifier: pas de suggk.txt dans {}, ignore", intent_dir)
                 continue
 
-            if intent_name not in INTENT_TIERS:
+            if intent_name not in SUPPORTED_INTENTS:
                 logger.warning("IntentClassifier: intent '{}' non supporte, ignore", intent_name)
                 continue
 
@@ -349,7 +358,7 @@ class IntentClassifier:
 
             texts.extend(examples)
             labels.extend([intent_name] * len(examples))
-            self.intent_tier_map[intent_name] = INTENT_TIERS[intent_name]
+            self.active_intents.add(intent_name)
 
         if not texts:
             logger.error("IntentClassifier: aucun exemple valide charge.")
@@ -368,6 +377,7 @@ class IntentClassifier:
             self.example_embeddings = embeddings_np
             self.example_labels = labels
             self.example_texts = texts
+            self._build_exact_example_index(texts, labels)
             self._loaded = True
 
             elapsed = (time.perf_counter() - start) * 1000
@@ -375,13 +385,83 @@ class IntentClassifier:
             logger.info(
                 "IntentClassifier pret: {} exemples, {} intents, {:.0f}ms",
                 len(texts),
-                len(self.intent_tier_map),
+                len(self.active_intents),
                 elapsed,
             )
             for intent in sorted(counts):
                 logger.debug("  {}: {} exemples", intent, counts[intent])
         except Exception as exc:
             logger.error("IntentClassifier: erreur calcul embeddings: {}", exc)
+
+    def _load_examples_from_mapping(self, start: float) -> None:
+        texts: List[str] = []
+        labels: List[str] = []
+
+        for intent_name, examples in sorted((self.examples_by_intent or {}).items()):
+            if intent_name not in SUPPORTED_INTENTS:
+                logger.warning("IntentClassifier: intent '{}' non supporte depuis PostgreSQL, ignore", intent_name)
+                continue
+
+            cleaned = []
+            seen: set[str] = set()
+            for example in examples:
+                text = str(example or "").strip()
+                if text and text not in seen:
+                    seen.add(text)
+                    cleaned.append(text)
+
+            if not cleaned:
+                continue
+
+            texts.extend(cleaned)
+            labels.extend([intent_name] * len(cleaned))
+            self.active_intents.add(intent_name)
+
+        if not texts:
+            logger.error("IntentClassifier: aucun exemple PostgreSQL valide charge.")
+            return
+
+        if not self._ensure_embeddings():
+            return
+
+        try:
+            raw_embeddings = self.embeddings.embed_documents(texts)
+            embeddings_np = np.array(raw_embeddings, dtype=np.float32)
+            norms = np.linalg.norm(embeddings_np, axis=1, keepdims=True)
+            norms = np.where(norms == 0, 1.0, norms)
+            embeddings_np = embeddings_np / norms
+
+            self.example_embeddings = embeddings_np
+            self.example_labels = labels
+            self.example_texts = texts
+            self._build_exact_example_index(texts, labels)
+            self._loaded = True
+
+            elapsed = (time.perf_counter() - start) * 1000
+            counts = Counter(labels)
+            logger.info(
+                "IntentClassifier PostgreSQL pret: {} exemples, {} intents, {:.0f}ms",
+                len(texts),
+                len(self.active_intents),
+                elapsed,
+            )
+            for intent in sorted(counts):
+                logger.debug("  {}: {} exemples", intent, counts[intent])
+        except Exception as exc:
+            logger.error("IntentClassifier: erreur calcul embeddings PostgreSQL: {}", exc)
+
+    def _build_exact_example_index(self, texts: List[str], labels: List[str]) -> None:
+        grouped: Dict[str, set[str]] = {}
+        for text, label in zip(texts, labels):
+            normalized = self._normalize_query(text).strip()
+            if not normalized:
+                continue
+            grouped.setdefault(normalized, set()).add(label)
+        self.exact_example_intents = {
+            normalized: next(iter(labels_for_text))
+            for normalized, labels_for_text in grouped.items()
+            if len(labels_for_text) == 1
+        }
 
     def classify(self, query: str) -> Dict[str, Any]:
         query = (query or "").strip()
@@ -404,6 +484,20 @@ class IntentClassifier:
 
         start = time.perf_counter()
         try:
+            exact_intent = self.exact_example_intents.get(self._normalize_query(query).strip())
+            if exact_intent and exact_intent in self.active_intents:
+                logger.info(
+                    "IntentClassifier exact: '{}' -> {}",
+                    query[:60],
+                    exact_intent,
+                )
+                return {
+                    "intent": exact_intent,
+                    "confidence": 1.0,
+                    "reasoning": "exact active example match",
+                    "loaded": True,
+                }
+
             query_embedding = np.array(self.embeddings.embed_query(query), dtype=np.float32)
             norm = np.linalg.norm(query_embedding)
             if norm > 0:
@@ -435,7 +529,6 @@ class IntentClassifier:
             elif confidence < CLASSIFICATION_FALLBACK_THRESHOLD:
                 winner = "retrieval"
 
-            tier = self.intent_tier_map.get(winner, INTENT_TIERS.get(winner, 1))
             elapsed_ms = (time.perf_counter() - start) * 1000
 
             top3_str = ", ".join(
@@ -454,10 +547,9 @@ class IntentClassifier:
                 )
 
             logger.info(
-                "IntentClassifier: '{}' -> {} [tier {}] conf={:.3f} ({:.0f}ms)",
+                "IntentClassifier: '{}' -> {} conf={:.3f} ({:.0f}ms)",
                 query[:60],
                 winner,
-                tier,
                 confidence,
                 elapsed_ms,
             )
@@ -465,7 +557,6 @@ class IntentClassifier:
             return {
                 "intent": winner,
                 "confidence": confidence,
-                "tier": tier,
                 "reasoning": reasoning,
                 "loaded": True,
             }
@@ -493,7 +584,6 @@ class IntentClassifier:
         return {
             "intent": "retrieval",
             "confidence": 0.0,
-            "tier": INTENT_TIERS["retrieval"],
             "reasoning": f"Fallback: {reason}",
             "loaded": False,
         }
@@ -502,12 +592,6 @@ class IntentClassifier:
     def is_loaded(self) -> bool:
         return self._loaded
 
-    def get_intents_by_tier(self) -> Dict[int, List[str]]:
-        by_tier: Dict[int, List[str]] = {}
-        for intent, tier in sorted(self.intent_tier_map.items()):
-            by_tier.setdefault(tier, []).append(intent)
-        return {tier: sorted(intents) for tier, intents in sorted(by_tier.items())}
-
     def get_stats(self) -> Dict[str, Any]:
         if not self._loaded:
             return {"loaded": False}
@@ -515,10 +599,9 @@ class IntentClassifier:
         return {
             "loaded": True,
             "total_examples": len(self.example_labels),
-            "total_intents": len(self.intent_tier_map),
+            "total_intents": len(self.active_intents),
             "top_k": self.top_k,
             "gate_threshold": self.gate_confidence_threshold,
             "standalone_mode": not self._shared_embeddings_provided,
-            "intents_by_tier": self.get_intents_by_tier(),
             "examples_per_intent": dict(counts),
         }

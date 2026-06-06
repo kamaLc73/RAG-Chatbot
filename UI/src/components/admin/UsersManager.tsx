@@ -76,7 +76,7 @@ function UserModal({
   onSubmit: (event: FormEvent) => void;
 }) {
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4">
+    <div className="app-modal-overlay">
       <form onSubmit={onSubmit} className="w-full max-w-lg rounded-lg border border-border bg-card p-6 shadow-xl">
         <div className="mb-5 flex items-start justify-between gap-4">
           <div>
@@ -168,7 +168,7 @@ function DeleteUserModal({
   onConfirm: () => void;
 }) {
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4">
+    <div className="app-modal-overlay">
       <div className="w-full max-w-md rounded-lg border border-border bg-card p-6 shadow-xl">
         <div className="mb-4 flex items-start gap-3">
           <div className="rounded-full bg-destructive/10 p-2 text-destructive">
