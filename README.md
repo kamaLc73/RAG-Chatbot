@@ -34,7 +34,7 @@ $env:API_BOOTSTRAP_SUPERUSER_USERNAME="admin_local"
 $env:API_BOOTSTRAP_SUPERUSER_FULL_NAME="admin local"
 $env:API_BOOTSTRAP_SUPERUSER_PASSWORD="<mot-de-passe-local>"
 $env:DOCKER_OLLAMA_BASE_URL="http://host.docker.internal:11434"
-$env:OLLAMA_MODEL="mistral:latest"
+$env:OLLAMA_MODEL="ministral-3:14b-cloud"
 docker compose up --build
 ```
 

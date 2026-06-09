@@ -23,7 +23,7 @@ x-api-environment: &api-environment
   VESPA_PORT: 8080
   VESPA_CONTENT_CLUSTER: rcar_cnra
   OLLAMA_BASE_URL: ${DOCKER_OLLAMA_BASE_URL:-http://host.docker.internal:11434}
-  OLLAMA_MODEL: ${OLLAMA_MODEL:-mistral:latest}
+  OLLAMA_MODEL: ${OLLAMA_MODEL:-ministral-3:14b-cloud}
 
 x-api-volumes: &api-volumes
   - ./data:/app/data

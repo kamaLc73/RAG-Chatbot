@@ -61,7 +61,7 @@ DEFAULT_EMBEDDING_MODEL = "BAAI/bge-m3"
 RERANKER_MODEL = "BAAI/bge-reranker-v2-m3"
 HF_TOKEN = getenv("HF_TOKEN", "").strip().strip('"\'')
 
-OLLAMA_MODEL = getenv("OLLAMA_MODEL", "mistral:latest").strip().strip('"\'')
+OLLAMA_MODEL = getenv("OLLAMA_MODEL", "ministral-3:14b-cloud").strip().strip('"\'')
 OLLAMA_BASE_URL = getenv("OLLAMA_BASE_URL", "http://localhost:11434")
 OLLAMA_API_KEY = getenv("OLLAMA_API_KEY", "").strip().strip('"\'')
 OLLAMA_TEMPERATURE = 0.1
