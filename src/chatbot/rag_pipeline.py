@@ -24,7 +24,6 @@ from dotenv import load_dotenv
 from langchain_core.documents import Document
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.prompts import ChatPromptTemplate
-from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_ollama import ChatOllama
 from loguru import logger
 
@@ -38,6 +37,8 @@ if str(src_root) not in sys.path:
     sys.path.insert(0, str(src_root))
 
 from config.logger import setup_logger
+from config.embedding_cache import make_huggingface_embeddings
+from config.reranker_cache import DEFAULT_RERANKER_MODEL, make_cross_encoder_reranker
 from config.settings import BASE_DIR, LOGS_DIR, VESPA_PORT, VESPA_URL
 from store.vespa_store import count_schema, make_vespa_app, query_schema
 
@@ -58,7 +59,7 @@ except Exception:
 load_dotenv(BASE_DIR / ".env")
 
 DEFAULT_EMBEDDING_MODEL = "BAAI/bge-m3"
-RERANKER_MODEL = "BAAI/bge-reranker-v2-m3"
+RERANKER_MODEL = getenv("RERANKER_MODEL", DEFAULT_RERANKER_MODEL).strip().strip('"\'')
 HF_TOKEN = getenv("HF_TOKEN", "").strip().strip('"\'')
 
 OLLAMA_MODEL = getenv("OLLAMA_MODEL", "ministral-3:14b-cloud").strip().strip('"\'')
@@ -173,13 +174,9 @@ class RAGPipeline:
             device = "cpu"
 
         logger.info("Embedding: {} sur {}", embedding_model, device)
-        model_kwargs: dict = {"device": device}
-        if HF_TOKEN:
-            model_kwargs["token"] = HF_TOKEN
-
-        self.embeddings = HuggingFaceEmbeddings(
+        self.embeddings = make_huggingface_embeddings(
             model_name=embedding_model,
-            model_kwargs=model_kwargs,
+            device=device,
             encode_kwargs={"normalize_embeddings": True, "batch_size": 32},
         )
 
@@ -197,8 +194,8 @@ class RAGPipeline:
         try:
             if CrossEncoder is None:
                 raise ImportError("sentence_transformers indisponible")
-            self.shared_reranker = CrossEncoder(
-                RERANKER_MODEL,
+            self.shared_reranker = make_cross_encoder_reranker(
+                model_name=RERANKER_MODEL,
                 max_length=512,
                 device=device,
             )

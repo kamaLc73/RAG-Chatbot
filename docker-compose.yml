@@ -1,6 +1,8 @@
 x-api-build: &api-build
   context: .
   dockerfile: Dockerfile.api
+  args:
+    INSTALL_TESSERACT: ${INSTALL_TESSERACT:-false}
 
 x-api-environment: &api-environment
   DATABASE_URL: postgresql+asyncpg://chatbot:chatbot_pass@postgres:5432/chatbot_db
@@ -22,14 +24,19 @@ x-api-environment: &api-environment
   VESPA_URL: http://vespa
   VESPA_PORT: 8080
   VESPA_CONTENT_CLUSTER: rcar_cnra
+  EMBEDDING_MODEL: ${EMBEDDING_MODEL:-BAAI/bge-m3}
+  EMBEDDING_MODEL_DIR: ${EMBEDDING_MODEL_DIR:-/app/data/models/embeddings}
+  RERANKER_MODEL: ${RERANKER_MODEL:-BAAI/bge-reranker-v2-m3}
+  RERANKER_MODEL_DIR: ${RERANKER_MODEL_DIR:-/app/data/models/rerankers}
+  HF_HOME: ${HF_HOME:-/app/data/models/huggingface}
+  TRANSFORMERS_CACHE: ${TRANSFORMERS_CACHE:-/app/data/models/huggingface/transformers}
+  SENTENCE_TRANSFORMERS_HOME: ${SENTENCE_TRANSFORMERS_HOME:-/app/data/models/sentence_transformers}
   OLLAMA_BASE_URL: ${DOCKER_OLLAMA_BASE_URL:-http://host.docker.internal:11434}
   OLLAMA_MODEL: ${OLLAMA_MODEL:-ministral-3:14b-cloud}
 
 x-api-volumes: &api-volumes
   - ./data:/app/data
   - ./logs:/app/logs
-  - hf_cache:/root/.cache/huggingface
-  - torch_cache:/root/.cache/torch
   - whisper_cache:/root/.cache/whisper
 
 services:
@@ -74,7 +81,7 @@ services:
       api:
         condition: service_started
     healthcheck:
-      test: ["CMD", "wget", "-qO-", "http://localhost/health"]
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1/health"]
       interval: 15s
       timeout: 5s
       retries: 10
@@ -138,6 +145,22 @@ services:
       vespa:
         condition: service_healthy
 
+  download-embeddings:
+    profiles: ["index"]
+    build: *api-build
+    image: rag-chatbot-api:local
+    environment: *api-environment
+    volumes: *api-volumes
+    command: ["python", "src/preparation/download_embedding_model.py"]
+
+  download-reranker:
+    profiles: ["index"]
+    build: *api-build
+    image: rag-chatbot-api:local
+    environment: *api-environment
+    volumes: *api-volumes
+    command: ["python", "src/preparation/download_reranker_model.py"]
+
   index-forms:
     profiles: ["index"]
     build: *api-build
@@ -163,6 +186,4 @@ services:
 volumes:
   vespa_data:
   postgres_data:
-  hf_cache:
-  torch_cache:
   whisper_cache:

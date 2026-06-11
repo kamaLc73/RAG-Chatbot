@@ -7,7 +7,6 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 from langchain_core.documents import Document
-from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 
@@ -17,6 +16,7 @@ if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
 from store.vespa_store import delete_all_docs, feed_documents, make_vespa_app, stable_data_id
+from config.embedding_cache import make_huggingface_embeddings, resolve_embedding_device
 
 load_dotenv(PROJECT_ROOT / ".env")
 LOG_DIR = PROJECT_ROOT / "logs"
@@ -64,17 +64,6 @@ def _is_supported_document(path: Path) -> bool:
 
 def _list_supported_documents(folder: Path) -> list[Path]:
     return sorted(path for path in folder.rglob("*") if _is_supported_document(path))
-
-
-def _resolve_embedding_device():
-    try:
-        import torch
-
-        if torch.cuda.is_available():
-            return "cuda"
-    except Exception:
-        pass
-    return "cpu"
 
 
 def analyze_processed_data(
@@ -314,19 +303,11 @@ def index_data(
     if not chunks:
         raise ValueError("Aucun chunk genere. Verifiez les contenus FAQ md/txt.")
 
-    device = _resolve_embedding_device()
-    hf_token = os.getenv("HF_TOKEN")
+    device = resolve_embedding_device()
     logging.info("Embedding device utilise pour l'indexation: %s", device)
-    if not hf_token:
-        logging.warning("HF_TOKEN non configure: telechargement Hugging Face en mode non authentifie.")
-
-    model_kwargs: dict = {"device": device}
-    if hf_token:
-        model_kwargs["token"] = hf_token
-
-    embeddings = HuggingFaceEmbeddings(
+    embeddings = make_huggingface_embeddings(
         model_name=EMBEDDING_MODEL,
-        model_kwargs=model_kwargs,
+        device=device,
         encode_kwargs={"normalize_embeddings": True},
     )
 

@@ -178,10 +178,10 @@ def _get_embeddings(request: Request):
     if embeddings is not None:
         return embeddings
 
-    from langchain_huggingface import HuggingFaceEmbeddings
+    from src.config.embedding_cache import make_huggingface_embeddings
     from src.chatbot.rag_pipeline import DEFAULT_EMBEDDING_MODEL
 
-    return HuggingFaceEmbeddings(
+    return make_huggingface_embeddings(
         model_name=DEFAULT_EMBEDDING_MODEL,
         encode_kwargs={"normalize_embeddings": True},
     )

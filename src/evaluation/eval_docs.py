@@ -623,9 +623,9 @@ def setup_judge(
     cerebras_reasoning_effort: str,
     cerebras_reasoning_format: str,
 ):
-    from langchain_huggingface import HuggingFaceEmbeddings
     from langchain_core.rate_limiters import InMemoryRateLimiter
     from langchain_openai import ChatOpenAI
+    from config.embedding_cache import make_huggingface_embeddings
     from ragas.embeddings import LangchainEmbeddingsWrapper
     from ragas.llms import LangchainLLMWrapper
 
@@ -657,7 +657,7 @@ def setup_judge(
             llm_kwargs["extra_body"] = extra_body
     llm = ChatOpenAI(**llm_kwargs)
 
-    embeddings = HuggingFaceEmbeddings(
+    embeddings = make_huggingface_embeddings(
         model_name=DEFAULT_EMBEDDING_MODEL,
         encode_kwargs={"normalize_embeddings": True},
     )

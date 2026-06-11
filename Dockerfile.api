@@ -1,5 +1,7 @@
 FROM python:3.12-slim
 
+ARG INSTALL_TESSERACT=false
+
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
@@ -14,9 +16,12 @@ RUN apt-get update \
       ffmpeg \
       git \
       poppler-utils \
-      tesseract-ocr \
-      tesseract-ocr-ara \
-      tesseract-ocr-fra \
+    && if [ "$INSTALL_TESSERACT" = "true" ]; then \
+      apt-get install -y --no-install-recommends \
+        tesseract-ocr \
+        tesseract-ocr-ara \
+        tesseract-ocr-fra; \
+    fi \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt ./

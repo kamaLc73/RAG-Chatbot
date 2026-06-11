@@ -22,7 +22,15 @@ from loguru import logger
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from config.logger import setup_logger
-from config.settings import DATA_DIR, LOGS_DIR, RAW_DIR, SOURCES
+from config.settings import (
+    DATA_DIR,
+    LOGS_DIR,
+    MISTRAL_OCR_MODEL,
+    MISTRAL_OCR_PAGES_PER_MINUTE,
+    MISTRAL_OCR_TIMEOUT_SECONDS,
+    RAW_DIR,
+    SOURCES,
+)
 from preparation.pipeline import (
     run_preparation,
     write_minimal_report,
@@ -67,26 +75,61 @@ Examples:
         help="Emit progress logs every N processed items.",
     )
     parser.add_argument(
+        "--ocr-engine",
+        choices=["mistral", "tesseract"],
+        default="mistral",
+        help="OCR engine for scanned PDFs after native extraction.",
+    )
+    parser.add_argument(
+        "--mistral-model",
+        default=MISTRAL_OCR_MODEL,
+        help="Mistral OCR model used when --ocr-engine=mistral.",
+    )
+    parser.add_argument(
+        "--ocr-delay",
+        type=float,
+        default=2.0,
+        help="Base delay in seconds between Mistral OCR attempts.",
+    )
+    parser.add_argument(
+        "--ocr-max-retries",
+        type=int,
+        default=2,
+        help="Maximum Mistral OCR attempts per PDF.",
+    )
+    parser.add_argument(
+        "--mistral-ocr-pages-per-minute",
+        type=int,
+        default=MISTRAL_OCR_PAGES_PER_MINUTE,
+        help="Mistral OCR page budget per rolling minute.",
+    )
+    parser.add_argument(
+        "--mistral-ocr-timeout",
+        type=int,
+        default=MISTRAL_OCR_TIMEOUT_SECONDS,
+        help="HTTP timeout in seconds for each Mistral OCR request.",
+    )
+    parser.add_argument(
         "--ocr-languages",
         default="fra+ara",
-        help="Tesseract OCR language string (example: fra+ara).",
+        help="Tesseract OCR language string when --ocr-engine=tesseract.",
     )
     parser.add_argument(
         "--ocr-config",
         default="--oem 3 --psm 6",
-        help="Tesseract OCR config string.",
+        help="Tesseract OCR config string when --ocr-engine=tesseract.",
     )
     parser.add_argument(
         "--dpi",
         type=int,
         default=250,
-        help="Rendering DPI used before OCR.",
+        help="Rendering DPI used before Tesseract OCR.",
     )
     parser.add_argument(
         "--max-ocr-pages",
         type=int,
         default=0,
-        help="Maximum pages per PDF for OCR (0 = all pages).",
+        help="Maximum pages per PDF for Tesseract OCR (0 = all pages).",
     )
     return parser.parse_args()
 
@@ -108,11 +151,18 @@ def main() -> None:
     logger.info("Preparation start for sources: {}", ", ".join(s.upper() for s in sources))
     logger.info("Output format: .{}", args.output_format)
     logger.info("Min native chars: {}", max(0, args.min_native_chars))
-    logger.info("OCR engine: Siwar Tesseract")
-    logger.info("OCR languages: {}", args.ocr_languages)
-    logger.info("OCR config: {}", args.ocr_config)
-    logger.info("OCR DPI: {}", max(72, args.dpi))
-    logger.info("OCR max pages: {}", max(0, args.max_ocr_pages))
+    logger.info("OCR engine: {}", args.ocr_engine)
+    if args.ocr_engine == "mistral":
+        logger.info("Mistral OCR model: {}", args.mistral_model)
+        logger.info("Mistral OCR max retries: {}", max(1, args.ocr_max_retries))
+        logger.info("Mistral OCR base delay: {}", max(0.0, args.ocr_delay))
+        logger.info("Mistral OCR page limit: {}/min", max(1, args.mistral_ocr_pages_per_minute))
+        logger.info("Mistral OCR timeout: {}s", max(30, args.mistral_ocr_timeout))
+    else:
+        logger.info("OCR languages: {}", args.ocr_languages)
+        logger.info("OCR config: {}", args.ocr_config)
+        logger.info("OCR DPI: {}", max(72, args.dpi))
+        logger.info("OCR max pages: {}", max(0, args.max_ocr_pages))
 
     report = run_preparation(
         raw_dir=RAW_DIR,
@@ -125,6 +175,12 @@ def main() -> None:
         dpi=max(72, args.dpi),
         max_ocr_pages=max(0, args.max_ocr_pages),
         log_every=max(1, args.log_every),
+        ocr_engine=args.ocr_engine,
+        mistral_model=args.mistral_model,
+        ocr_delay=max(0.0, args.ocr_delay),
+        ocr_max_retries=max(1, args.ocr_max_retries),
+        mistral_ocr_pages_per_minute=max(1, args.mistral_ocr_pages_per_minute),
+        mistral_ocr_timeout_seconds=max(30, args.mistral_ocr_timeout),
     )
 
     report_path = write_minimal_report(processed_dir=processed_dir, report=report)

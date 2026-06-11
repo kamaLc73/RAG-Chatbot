@@ -24,6 +24,12 @@ from typing import Any, Dict, List, Optional
 import numpy as np
 from loguru import logger
 
+try:
+    from config.embedding_cache import make_huggingface_embeddings, resolve_embedding_device
+except Exception:
+    make_huggingface_embeddings = None
+    resolve_embedding_device = None
+
 INTENTS_DIR = Path(__file__).resolve().parents[2] / "data" / "intents"
 _STANDALONE_EMBEDDING_MODEL = "BAAI/bge-m3"
 
@@ -302,18 +308,12 @@ class IntentClassifier:
         )
 
         try:
-            import torch
-            from langchain_huggingface import HuggingFaceEmbeddings
-
-            device = "cuda" if torch.cuda.is_available() else "cpu"
-            hf_token = os.getenv("HF_TOKEN", "").strip()
-            model_kwargs: Dict[str, Any] = {"device": device}
-            if hf_token:
-                model_kwargs["token"] = hf_token
-
-            self.embeddings = HuggingFaceEmbeddings(
+            if make_huggingface_embeddings is None or resolve_embedding_device is None:
+                raise RuntimeError("embedding cache helper unavailable")
+            device = resolve_embedding_device()
+            self.embeddings = make_huggingface_embeddings(
                 model_name=_STANDALONE_EMBEDDING_MODEL,
-                model_kwargs=model_kwargs,
+                device=device,
                 encode_kwargs={"normalize_embeddings": True},
             )
             logger.info("IntentClassifier: embeddings standalone charges sur {}", device)

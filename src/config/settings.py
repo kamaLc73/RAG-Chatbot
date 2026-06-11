@@ -117,6 +117,12 @@ PDF_CONFIG = {
     "download_retry_backoff_base": 1.0,
 }
 
+# Mistral OCR is used by the preparation pipeline for scanned PDFs.
+MISTRAL_API_KEY = os.getenv("MISTRAL_API_KEY", "").strip()
+MISTRAL_OCR_MODEL = os.getenv("MISTRAL_OCR_MODEL", "mistral-ocr-latest").strip() or "mistral-ocr-latest"
+MISTRAL_OCR_PAGES_PER_MINUTE = int(os.getenv("MISTRAL_OCR_PAGES_PER_MINUTE", "550"))
+MISTRAL_OCR_TIMEOUT_SECONDS = int(os.getenv("MISTRAL_OCR_TIMEOUT_SECONDS", "300"))
+
 # ─────────────────────────────────────────────
 # SÉLECTEURS HTML À EXCLURE DU CONTENU
 # (menus, footer, navigation, cookies…)

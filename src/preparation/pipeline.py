@@ -13,17 +13,19 @@ Behavior:
 - Write JSON report with failures, OCR stats, and error samples
 
 OCR implementation:
-- Adapted from Siwar-Image-Reader OCR approach (Tesseract + preprocessing)
-- Optimized for PDFs only (no image-folder GUI features)
+- Mistral OCR for scanned PDFs through the Mistral OCR HTTP API
+- Legacy Siwar/Tesseract OCR remains available only when explicitly selected
 """
 
 from __future__ import annotations
 
 import hashlib
+import base64
 import json
 import os
 import re
 import shutil
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -72,8 +74,27 @@ try:
 except Exception:
     HAS_PYTESSERACT = False
 
+try:
+    import requests
+
+    HAS_REQUESTS = True
+except Exception as exc:
+    requests = None
+    HAS_REQUESTS = False
+
 
 MAX_ERROR_SAMPLES_PER_SOURCE = 50
+DEFAULT_MISTRAL_OCR_MODEL = os.getenv("MISTRAL_OCR_MODEL", "mistral-ocr-latest").strip() or "mistral-ocr-latest"
+DEFAULT_MISTRAL_OCR_PAGES_PER_MINUTE = int(os.getenv("MISTRAL_OCR_PAGES_PER_MINUTE", "550"))
+DEFAULT_MISTRAL_OCR_TIMEOUT_SECONDS = int(os.getenv("MISTRAL_OCR_TIMEOUT_SECONDS", "300"))
+MISTRAL_PASSWORD_SIGNALS = (
+    "password",
+    "encrypted",
+    "protected",
+    "forbidden",
+    "401",
+    "403",
+)
 
 ARABIC_CHAR_RE = re.compile(r"[\u0600-\u06FF\u0750-\u077F\u08A0-\u08FF]")
 LATIN_CHAR_RE = re.compile(r"[A-Za-zÀ-ÖØ-öø-ÿ]")
@@ -487,6 +508,190 @@ def _extract_ocr_pdf_text_siwar(
         return "", "ocr_failed"
 
 
+def _is_mistral_password_protected_error(error: str | None) -> bool:
+    if not error:
+        return False
+    error_lower = error.lower()
+    return any(signal in error_lower for signal in MISTRAL_PASSWORD_SIGNALS)
+
+
+def _count_pdf_pages(pdf_path: Path) -> int:
+    if HAS_PYMUPDF:
+        try:
+            doc = fitz.open(str(pdf_path))
+            page_count = int(doc.page_count)
+            doc.close()
+            return max(0, page_count)
+        except Exception:
+            pass
+
+    if HAS_PDFPLUMBER:
+        try:
+            with pdfplumber.open(pdf_path) as pdf:
+                return max(0, len(pdf.pages))
+        except Exception:
+            pass
+
+    return 0
+
+
+class _MistralOcrPageRateLimiter:
+    def __init__(self, pages_per_minute: int) -> None:
+        self.pages_per_minute = max(1, int(pages_per_minute))
+        self._events: list[tuple[float, int]] = []
+
+    def wait_for(self, page_count: int) -> None:
+        pages = max(1, int(page_count or 1))
+        if pages > self.pages_per_minute:
+            logger.warning(
+                "Mistral OCR PDF has {} pages, above the configured {} pages/minute limit. "
+                "This single request may still hit the provider limit.",
+                pages,
+                self.pages_per_minute,
+            )
+
+        while True:
+            now = time.monotonic()
+            self._events = [
+                (timestamp, event_pages)
+                for timestamp, event_pages in self._events
+                if now - timestamp < 60.0
+            ]
+            used_pages = sum(event_pages for _, event_pages in self._events)
+            if used_pages + pages <= self.pages_per_minute or pages > self.pages_per_minute:
+                self._events.append((now, pages))
+                return
+
+            oldest_timestamp = min(timestamp for timestamp, _ in self._events)
+            sleep_seconds = max(0.5, 60.0 - (now - oldest_timestamp) + 0.5)
+            logger.info(
+                "Mistral OCR page rate limit: used={} incoming={} limit={}/min. Sleeping {:.1f}s.",
+                used_pages,
+                pages,
+                self.pages_per_minute,
+                sleep_seconds,
+            )
+            time.sleep(sleep_seconds)
+
+
+def _extract_ocr_pdf_text_mistral(
+    pdf_path: Path,
+    *,
+    model: str,
+    delay: float,
+    output_dir: Path,
+    timeout_seconds: int,
+) -> tuple[str, str, str | None]:
+    if not HAS_REQUESTS or requests is None:
+        return "", "ocr_mistral_unavailable", "requests_unavailable"
+
+    api_key = os.getenv("MISTRAL_API_KEY", "").strip()
+    if not api_key:
+        return "", "ocr_mistral_unavailable", "mistral_api_key_missing"
+
+    try:
+        pdf_b64 = base64.standard_b64encode(pdf_path.read_bytes()).decode()
+        payload = {
+            "model": model or DEFAULT_MISTRAL_OCR_MODEL,
+            "document": {
+                "type": "document_url",
+                "document_url": f"data:application/pdf;base64,{pdf_b64}",
+            },
+            "include_image_base64": False,
+        }
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        }
+
+        if delay > 0:
+            time.sleep(delay)
+
+        response = requests.post(
+            "https://api.mistral.ai/v1/ocr",
+            headers=headers,
+            json=payload,
+            timeout=max(30, int(timeout_seconds)),
+        )
+        if response.status_code >= 400:
+            try:
+                error_body = response.json()
+            except Exception:
+                error_body = response.text
+            return "", "ocr_mistral_failed", f"HTTP {response.status_code}: {error_body}"
+
+        data = response.json()
+        page_texts: list[str] = []
+        for page in data.get("pages", []):
+            if not isinstance(page, dict):
+                continue
+            page_text = str(page.get("markdown") or page.get("text") or "").strip()
+            if page_text:
+                page_texts.append(page_text)
+
+        text = "\n\n---\n\n".join(page_texts).strip()
+        if not text:
+            text = str(data.get("text") or "").strip()
+        if not text:
+            return "", "ocr_mistral_empty", "empty_text"
+
+        return text, "ocr_mistral", None
+
+    except Exception as exc:
+        logger.warning("Mistral OCR failed for {}: {}", pdf_path, exc)
+        return "", "ocr_mistral_failed", str(exc)
+
+
+def _write_pdf_text_outputs(
+    *,
+    processed_dir: Path,
+    source: str,
+    output_format: str,
+    job: dict[str, Any],
+    pdf_path: Path,
+    text: str,
+    extraction_method: str,
+    filename_prefix: str,
+) -> None:
+    languages, reason = classify_languages(
+        text=text,
+        title=str(job.get("title", "")),
+        url=str(job.get("source_url", "")),
+        html_language_hint=None,
+        extra_hints=[
+            str(job.get("source_page_language", "")),
+            str(job.get("crawler_pdf_url_language_hint", "")),
+        ],
+    )
+
+    for language in languages:
+        output_path = _build_output_path(
+            processed_dir=processed_dir,
+            kind="pdfs",
+            source=source,
+            language=language,
+            doc_id=str(job.get("doc_id", "pdf_doc")),
+            output_format=output_format,
+            filename_prefix=filename_prefix,
+        )
+        rendered = _render_text_document(
+            title=str(job.get("title", "")),
+            content=text,
+            metadata={
+                "doc_id": str(job.get("doc_id", "pdf_doc")),
+                "source": source,
+                "kind": "pdf",
+                "language": language,
+                "language_reason": reason,
+                "url": str(job.get("source_url", "")),
+                "source_path": str(pdf_path),
+                "extraction_method": extraction_method,
+            },
+            output_format=output_format,
+        )
+        _write_text(output_path, rendered)
+
+
 def prepare_source_pages(
     *,
     raw_dir: Path,
@@ -727,20 +932,32 @@ def prepare_source_ocr_pdfs(
     source: str,
     output_format: str,
     ocr_jobs: list[dict[str, Any]],
-    ocr_languages: str,
-    ocr_config: str,
-    dpi: int,
-    max_ocr_pages: int,
-    log_every: int,
+    ocr_engine: str = "mistral",
+    mistral_model: str = DEFAULT_MISTRAL_OCR_MODEL,
+    ocr_delay: float = 2.0,
+    ocr_max_retries: int = 2,
+    mistral_ocr_pages_per_minute: int = DEFAULT_MISTRAL_OCR_PAGES_PER_MINUTE,
+    mistral_ocr_timeout_seconds: int = DEFAULT_MISTRAL_OCR_TIMEOUT_SECONDS,
+    ocr_artifacts_dir: Path | None = None,
+    ocr_languages: str = "fra+ara",
+    ocr_config: str = "--oem 3 --psm 6",
+    dpi: int = 250,
+    max_ocr_pages: int = 0,
+    log_every: int = 20,
 ) -> dict[str, Any]:
     """
     Phase 2: prepare OCR PDFs from in-memory queue.
     """
     pdf_failures = 0
     error_samples: list[dict[str, str]] = []
+    engine = (ocr_engine or "mistral").strip().lower()
+    if engine in {"mistral-ocr", "mistral_ocr"}:
+        engine = "mistral"
+    if engine not in {"mistral", "tesseract"}:
+        engine = "mistral"
 
     ocr_stats = {
-        "engine": "siwar_tesseract",
+        "engine": "mistral_ocr" if engine == "mistral" else "siwar_tesseract",
         "queued": len(ocr_jobs),
         "attempted": 0,
         "succeeded": 0,
@@ -751,6 +968,121 @@ def prepare_source_ocr_pdfs(
         logger.info("[{}] no OCR jobs", source.upper())
         return {
             "failures": 0,
+            "ocr_stats": ocr_stats,
+            "error_samples": error_samples,
+        }
+
+    if engine == "mistral":
+        api_key_available = bool(os.getenv("MISTRAL_API_KEY", "").strip())
+        if not HAS_REQUESTS or not api_key_available:
+            pdf_failures = len(ocr_jobs)
+            ocr_stats["attempted"] = len(ocr_jobs)
+            ocr_stats["failed"] = len(ocr_jobs)
+            reason = (
+                "requests_unavailable"
+                if not HAS_REQUESTS
+                else "mistral_api_key_missing"
+            )
+            _push_error_sample(
+                error_samples,
+                stage="ocr_setup",
+                path=source,
+                reason=reason,
+            )
+            logger.warning(
+                "[{}] Mistral OCR unavailable. Marked {} OCR jobs as failures.",
+                source.upper(),
+                len(ocr_jobs),
+            )
+            return {
+                "failures": pdf_failures,
+                "ocr_stats": ocr_stats,
+                "error_samples": error_samples,
+            }
+
+        artifacts_dir = ocr_artifacts_dir or (processed_dir / "_ocr_artifacts" / source)
+        page_limiter = _MistralOcrPageRateLimiter(
+            pages_per_minute=max(1, mistral_ocr_pages_per_minute)
+        )
+        logger.info("[{}] Mistral OCR memory queue size: {}", source.upper(), len(ocr_jobs))
+        logger.info(
+            "[{}] Mistral OCR page limit: {}/min, timeout={}s",
+            source.upper(),
+            max(1, mistral_ocr_pages_per_minute),
+            max(30, mistral_ocr_timeout_seconds),
+        )
+
+        for index, job in enumerate(ocr_jobs, start=1):
+            ocr_stats["attempted"] += 1
+            pdf_path = Path(str(job.get("pdf_path", "")))
+            estimated_pages = _count_pdf_pages(pdf_path) or 1
+            success = False
+            last_error = ""
+
+            for attempt in range(1, max(1, ocr_max_retries) + 1):
+                retry_delay = 0.0 if attempt == 1 else max(0.0, ocr_delay) * (2 ** (attempt - 2))
+                page_limiter.wait_for(estimated_pages)
+                ocr_text, ocr_method, error = _extract_ocr_pdf_text_mistral(
+                    pdf_path=pdf_path,
+                    model=mistral_model or DEFAULT_MISTRAL_OCR_MODEL,
+                    delay=retry_delay,
+                    output_dir=artifacts_dir,
+                    timeout_seconds=max(30, mistral_ocr_timeout_seconds),
+                )
+
+                if error and _is_mistral_password_protected_error(error):
+                    last_error = f"password_protected:{error}"
+                    break
+
+                if error:
+                    last_error = error
+                    if attempt < max(1, ocr_max_retries):
+                        logger.warning(
+                            "[{}] Mistral OCR retry {}/{} for {}: {}",
+                            source.upper(),
+                            attempt,
+                            max(1, ocr_max_retries),
+                            pdf_path,
+                            error,
+                        )
+                        continue
+
+                if not ocr_text.strip():
+                    last_error = error or f"empty_text:{ocr_method}"
+                    if attempt < max(1, ocr_max_retries):
+                        continue
+                    break
+
+                _write_pdf_text_outputs(
+                    processed_dir=processed_dir,
+                    source=source,
+                    output_format=output_format,
+                    job=job,
+                    pdf_path=pdf_path,
+                    text=ocr_text,
+                    extraction_method=ocr_method,
+                    filename_prefix="pdf_ocr",
+                )
+                ocr_stats["succeeded"] += 1
+                success = True
+                break
+
+            if not success:
+                pdf_failures += 1
+                ocr_stats["failed"] += 1
+                _push_error_sample(
+                    error_samples,
+                    stage="ocr_extract",
+                    path=str(pdf_path),
+                    reason=last_error or "mistral_ocr_failed",
+                )
+
+            if index % max(1, log_every) == 0 or index == len(ocr_jobs):
+                logger.info("[{}] pdf ocr progress: {}/{}", source.upper(), index, len(ocr_jobs))
+
+        logger.info("[{}] Mistral OCR phase done, failures={}", source.upper(), pdf_failures)
+        return {
+            "failures": pdf_failures,
             "ocr_stats": ocr_stats,
             "error_samples": error_samples,
         }
@@ -877,6 +1209,12 @@ def run_preparation(
     dpi: int,
     max_ocr_pages: int,
     log_every: int,
+    ocr_engine: str = "mistral",
+    mistral_model: str = DEFAULT_MISTRAL_OCR_MODEL,
+    ocr_delay: float = 2.0,
+    ocr_max_retries: int = 2,
+    mistral_ocr_pages_per_minute: int = DEFAULT_MISTRAL_OCR_PAGES_PER_MINUTE,
+    mistral_ocr_timeout_seconds: int = DEFAULT_MISTRAL_OCR_TIMEOUT_SECONDS,
 ) -> dict[str, Any]:
     source_stats: dict[str, dict[str, Any]] = {}
 
@@ -906,6 +1244,13 @@ def run_preparation(
             source=source,
             output_format=output_format,
             ocr_jobs=list(native_pdf_result.get("ocr_jobs", [])),
+            ocr_engine=ocr_engine,
+            mistral_model=mistral_model,
+            ocr_delay=max(0.0, ocr_delay),
+            ocr_max_retries=max(1, ocr_max_retries),
+            mistral_ocr_pages_per_minute=max(1, mistral_ocr_pages_per_minute),
+            mistral_ocr_timeout_seconds=max(30, mistral_ocr_timeout_seconds),
+            ocr_artifacts_dir=processed_dir / "_ocr_artifacts" / source,
             ocr_languages=ocr_languages,
             ocr_config=ocr_config,
             dpi=max(72, dpi),
@@ -925,7 +1270,7 @@ def run_preparation(
             "page_failures": page_failures,
             "pdf_failures": pdf_failures,
             "ocr_stats": {
-                "engine": str(ocr_stats.get("engine", "siwar_tesseract")),
+                "engine": str(ocr_stats.get("engine", ocr_engine)),
                 "queued": int(ocr_stats.get("queued", 0)),
                 "attempted": int(ocr_stats.get("attempted", 0)),
                 "succeeded": int(ocr_stats.get("succeeded", 0)),

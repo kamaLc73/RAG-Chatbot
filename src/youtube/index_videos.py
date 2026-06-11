@@ -31,6 +31,7 @@ except ImportError:
     load_dotenv(BASE_DIR / ".env")
 
 from store.vespa_store import delete_all_docs, feed_documents, make_vespa_app, stable_data_id
+from config.embedding_cache import make_huggingface_embeddings, resolve_embedding_device
 
 logging.getLogger("vespa").setLevel(logging.WARNING)
 logging.getLogger("vespa.application").setLevel(logging.WARNING)
@@ -115,15 +116,6 @@ def chunk_documents(documents: list) -> list:
     return documents
 
 
-def _resolve_embedding_device() -> str:
-    try:
-        import torch
-
-        return "cuda" if torch.cuda.is_available() else "cpu"
-    except Exception:
-        return "cpu"
-
-
 def index_videos(
     transcripts_file: Path = TRANSCRIPTS_FILE,
     vespa_url: str = VESPA_URL,
@@ -133,8 +125,6 @@ def index_videos(
     min_transcript_chars: int = MIN_TRANSCRIPT_CHARS,
     reset: bool = True,
 ) -> dict:
-    from langchain_huggingface import HuggingFaceEmbeddings
-
     videos = load_transcripts(transcripts_file)
     documents = build_documents(videos, min_chars=min_transcript_chars)
 
@@ -148,17 +138,12 @@ def index_videos(
     if not chunks:
         raise ValueError("Aucun document genere.")
 
-    device = _resolve_embedding_device()
+    device = resolve_embedding_device()
     logger.info("Device embedding: {}", device)
 
-    hf_token = os.getenv("HF_TOKEN")
-    model_kwargs: dict = {"device": device}
-    if hf_token:
-        model_kwargs["token"] = hf_token
-
-    embeddings = HuggingFaceEmbeddings(
+    embeddings = make_huggingface_embeddings(
         model_name=embedding_model,
-        model_kwargs=model_kwargs,
+        device=device,
         encode_kwargs={"normalize_embeddings": True},
     )
 

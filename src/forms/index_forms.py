@@ -25,6 +25,7 @@ except ImportError:
     setup_logger = None
 
 from store.vespa_store import delete_all_docs, feed_documents, make_vespa_app, stable_data_id
+from config.embedding_cache import make_huggingface_embeddings, resolve_embedding_device
 
 logging.getLogger("vespa").setLevel(logging.WARNING)
 logging.getLogger("vespa.application").setLevel(logging.WARNING)
@@ -101,15 +102,6 @@ def build_documents(forms: list[dict]) -> list:
     return docs
 
 
-def _resolve_embedding_device() -> str:
-    try:
-        import torch
-
-        return "cuda" if torch.cuda.is_available() else "cpu"
-    except Exception:
-        return "cpu"
-
-
 def index_forms(
     catalog_file: Path = CATALOG_FILE,
     vespa_url: str = VESPA_URL,
@@ -118,8 +110,6 @@ def index_forms(
     embedding_model: str = EMBEDDING_MODEL,
     reset: bool = True,
 ) -> dict:
-    from langchain_huggingface import HuggingFaceEmbeddings
-
     if not catalog_file.exists():
         raise FileNotFoundError(
             f"forms.json introuvable: {catalog_file}\n"
@@ -133,17 +123,13 @@ def index_forms(
     if not documents:
         raise ValueError("Aucun document valide. Verifie que scrape_forms.py et extract_text.py ont tourne.")
 
-    device = _resolve_embedding_device()
-    hf_token = os.getenv("HF_TOKEN", "").strip()
-    model_kwargs: dict = {"device": device}
-    if hf_token:
-        model_kwargs["token"] = hf_token
+    device = resolve_embedding_device()
 
     logger.info("Device: {} | Modele: {}", device, embedding_model)
 
-    embeddings = HuggingFaceEmbeddings(
+    embeddings = make_huggingface_embeddings(
         model_name=embedding_model,
-        model_kwargs=model_kwargs,
+        device=device,
         encode_kwargs={"normalize_embeddings": True},
     )
 
