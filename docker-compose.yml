@@ -31,7 +31,7 @@ x-api-environment: &api-environment
   HF_HOME: ${HF_HOME:-/app/data/models/huggingface}
   TRANSFORMERS_CACHE: ${TRANSFORMERS_CACHE:-/app/data/models/huggingface/transformers}
   SENTENCE_TRANSFORMERS_HOME: ${SENTENCE_TRANSFORMERS_HOME:-/app/data/models/sentence_transformers}
-  OLLAMA_BASE_URL: ${DOCKER_OLLAMA_BASE_URL:-http://host.docker.internal:11434}
+  OLLAMA_BASE_URL: ${DOCKER_OLLAMA_BASE_URL:-http://ollama:11434}
   OLLAMA_MODEL: ${OLLAMA_MODEL:-ministral-3:14b-cloud}
 
 x-api-volumes: &api-volumes
@@ -59,6 +59,8 @@ services:
       redis:
         condition: service_healthy
       vespa:
+        condition: service_healthy
+      ollama:
         condition: service_healthy
     healthcheck:
       test: ["CMD", "curl", "-sf", "http://localhost:8000/health"]
@@ -105,6 +107,34 @@ services:
       interval: 10s
       timeout: 5s
       retries: 12
+
+  ollama:
+    image: ollama/ollama:latest
+    container_name: ollama
+    ports:
+      - "${OLLAMA_HOST_PORT:-11434}:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+    environment:
+      OLLAMA_KEEP_ALIVE: ${OLLAMA_KEEP_ALIVE:-30m}
+      NVIDIA_VISIBLE_DEVICES: all
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 15s
+      timeout: 10s
+      retries: 20
+    gpus: all
+
+  prepare-ollama-cloud-model:
+    profiles: ["models"]
+    image: ollama/ollama:latest
+    environment:
+      OLLAMA_HOST: http://ollama:11434
+    command: ["pull", "${OLLAMA_MODEL:-ministral-3:14b-cloud}"]
+    depends_on:
+      ollama:
+        condition: service_healthy
 
   postgres:
     image: postgres:16-alpine
@@ -187,3 +217,4 @@ volumes:
   vespa_data:
   postgres_data:
   whisper_cache:
+  ollama_data:
