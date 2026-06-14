@@ -1,68 +1,103 @@
 # RAG Chatbot RCAR/CNRA
 
-Assistant conversationnel RAG (Retrieval-Augmented Generation) pour interroger des contenus RCAR/CNRA.
+Assistant conversationnel RAG pour interroger des contenus documentaires RCAR/CNRA en francais, avec separation des organismes, recherche hybride Vespa, API FastAPI et interface React.
 
-## Démarrage Docker
+## Prerequis
 
-Prérequis :
+- Docker Desktop lance.
+- Donnees preparees placees dans `data/supportstagerag/`, `data/forms/` et `data/youtube/`.
+- Un fichier `.env` cree depuis `.env.example`.
+- Acces Ollama Cloud ou session Ollama deja authentifiee pour `ministral-3:14b-cloud`.
+- `HF_TOKEN` si Hugging Face le demande pour telecharger les modeles BGE-M3 et reranker.
+- `MISTRAL_API_KEY` uniquement si la preparation OCR doit etre rejouee.
+- `CEREBRAS_API_KEY` uniquement pour rejouer les evaluations RAGAS.
 
-- Docker Desktop lancé.
-- Ollama lancé via Docker Compose ou sur la machine hôte, avec le modèle utilisé par `OLLAMA_MODEL`.
-- Le schéma Vespa doit être déployé avant une première indexation.
+Les donnees ne sont pas incluses dans le depot. Pour les obtenir, demander le jeu de donnees prepare au responsable du projet ou a l'encadrant autorise.
 
-Construire et lancer l'application :
+## Configuration
+
+Copier le modele d'environnement puis renseigner les valeurs necessaires :
 
 ```powershell
-docker compose up --build
+Copy-Item .env.example .env
 ```
 
-Connecter Ollama Cloud puis preparer le modele cloud utilise par le chatbot :
+Pour Ollama Cloud, connecter le conteneur Ollama avant de preparer le modele :
 
 ```powershell
 docker compose up -d ollama
 docker compose exec ollama ollama signin
-docker compose --profile models run --rm prepare-ollama-cloud-model
 ```
 
-URLs :
+## Installation automatisee
 
-- UI React : http://localhost:5173
-- API FastAPI : http://localhost:8000
-- Health API : http://localhost:8000/health
-- Vespa : http://localhost:8080
-- Vespa config : http://localhost:19071
-- Ollama : http://localhost:11434
-- PostgreSQL hôte : `localhost:5433`
-- Redis hôte : `localhost:6380`
+Le script `setup.py` orchestre les prerequis locaux :
 
-Variables utiles :
+- construction des images Docker ;
+- demarrage de Vespa, Ollama, PostgreSQL et Redis ;
+- preparation du modele Ollama ;
+- deploiement des schemas Vespa ;
+- telechargement des modeles d'embedding et de reranking ;
+- indexation des documents, formulaires et videos ;
+- lancement final de l'API et de l'interface.
+
+Commande principale :
 
 ```powershell
-$env:API_BOOTSTRAP_SUPERUSER_EMAIL="admin@cdg.dev"
-$env:API_BOOTSTRAP_SUPERUSER_USERNAME="admin_local"
-$env:API_BOOTSTRAP_SUPERUSER_FULL_NAME="admin local"
-$env:API_BOOTSTRAP_SUPERUSER_PASSWORD="<mot-de-passe-local>"
-$env:DOCKER_OLLAMA_BASE_URL="http://ollama:11434"
-$env:OLLAMA_MODEL="ministral-3:14b-cloud"
+python setup.py
+```
+
+L'indexation Vespa peut prendre plusieurs minutes au premier lancement, car les embeddings sont calcules puis inseres dans les schemas `doc`, `form` et `video`.
+
+Options utiles :
+
+```powershell
+python setup.py --skip-index
+python setup.py --skip-app-start
+python setup.py --strict-keys
+```
+
+## Commandes manuelles
+
+Construire et lancer les services :
+
+```powershell
 docker compose up --build
 ```
 
-Le frontend est compilé avec `DOCKER_VITE_API_URL`, par défaut `http://localhost:8000`.
-
-## Vespa et indexation
-
-Si le volume Vespa est vide, déployer d'abord le schéma Vespa depuis l'hôte :
+Indexer separement les donnees :
 
 ```powershell
-.\.venv\Scripts\python.exe -c "from pathlib import Path; import docker; from vespa.deployment import VespaDocker; client=docker.from_env(); container=client.containers.get('vespa'); VespaDocker(url='http://localhost', port=8080, container=container).deploy_from_disk(application_name='rcarcnra', application_root=Path('src/store/vespa'), max_wait_configserver=120, max_wait_application=120, docker_timeout=120); print('vespa deploy OK')"
+docker compose --profile index run --rm index-docs
+docker compose --profile index run --rm index-forms
+docker compose --profile index run --rm index-videos
 ```
 
-Indexer les données depuis les conteneurs :
+Precharger les modeles d'embedding et de reranking :
 
 ```powershell
-docker compose run --rm index-docs
-docker compose run --rm index-forms
-docker compose run --rm index-videos
+docker compose --profile index run --rm download-embeddings
+docker compose --profile index run --rm download-reranker
 ```
 
-Les services d'indexation utilisent les mêmes volumes `data`, `logs` et caches modèles que l'API.
+## URLs locales
+
+- UI React : [http://localhost:5173](http://localhost:5173)
+- API FastAPI : [http://localhost:8000](http://localhost:8000)
+- Health API : [http://localhost:8000/health](http://localhost:8000/health)
+- Vespa : [http://localhost:8080](http://localhost:8080)
+- Vespa config : [http://localhost:19071](http://localhost:19071)
+- Ollama : [http://localhost:11434](http://localhost:11434)
+- PostgreSQL : `localhost:5433`
+- Redis : `localhost:6380`
+
+## Structure principale
+
+```text
+src/chatbot/       Pipeline RAG, retrieval et reranking
+src/store/vespa/   Schemas et configuration Vespa
+src/evaluation/    Scripts d'evaluation
+UI/                Interface React
+data/              Donnees preparees et jeux d'evaluation
+logs/              Journaux applicatifs
+```
