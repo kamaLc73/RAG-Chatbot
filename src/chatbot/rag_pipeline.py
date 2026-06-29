@@ -300,7 +300,10 @@ class RAGPipeline:
         return (
             "VOTRE IDENTITE ET SCOPE:\n"
             "Vous etes l'assistant conjoint officiel du RCAR et de la CNRA.\n"
-            "Distinguez toujours les informations qui concernent le RCAR de celles qui concernent la CNRA."
+            "Distinguez toujours les informations qui concernent le RCAR de celles qui concernent la CNRA.\n"
+            "Si la question concerne clairement un seul organisme, repondez uniquement sur cet organisme. "
+            "Ne mentionnez pas l'autre organisme et ne dites pas que vous ne disposez pas d'information sur lui, "
+            "sauf si l'utilisateur le demande explicitement."
         )
 
     def _system_prompt(self) -> str:
@@ -362,6 +365,47 @@ CONTEXTE DOCUMENTAIRE:
                 if len(kw) >= min_keyword_len and f" {kw} " in normalized:
                     return "rcar"
         return ""
+
+    @staticmethod
+    def _doc_orgs(docs: list[Document]) -> set[str]:
+        orgs = set()
+        for doc in docs:
+            value = str(doc.metadata.get("org", "") or "").lower()
+            if value:
+                orgs.add(value)
+        return orgs
+
+    def _strip_unrequested_org_disclaimer(self, response: str, query: str, org: str, docs: list[Document]) -> str:
+        if org != "all" or not response:
+            return response
+
+        normalized_query = self._normalize_text(query)
+        query_mentions_rcar = any(f" {kw} " in normalized_query for kw in ("rcar", "rg", "rc"))
+        query_mentions_cnra = " cnra " in normalized_query
+        doc_orgs = self._doc_orgs(docs)
+
+        targets: list[tuple[str, str]] = []
+        if not query_mentions_cnra and (query_mentions_rcar or doc_orgs <= {"rcar", "both"}):
+            targets.append(("CNRA", "cnra.ma"))
+        if not query_mentions_rcar and (query_mentions_cnra or doc_orgs <= {"cnra", "both"}):
+            targets.append(("RCAR", "rcar.ma"))
+
+        cleaned = response
+        for label, website in targets:
+            cleaned = re.sub(
+                rf"(?im)^\s*(?:[-*]\s*)?Je ne dispose pas[^\n]*{label}[^\n]*(?:\n|$)",
+                "",
+                cleaned,
+            )
+            cleaned = re.sub(
+                rf"(?im)^\s*(?:[-*]\s*)?Consultez directement\s+{re.escape(website)}[^\n]*(?:\n|$)",
+                "",
+                cleaned,
+            )
+
+        cleaned = re.sub(r"(?m)^\s*-{3,}\s*$", "", cleaned)
+        cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+        return cleaned.strip()
 
     def _offscope_response(self, org: str, target: str, original_query: str) -> dict:
         if target == "cnra":
@@ -1284,6 +1328,7 @@ CONTEXTE DOCUMENTAIRE:
                     }
                 )
             ).strip()
+            response = self._strip_unrequested_org_disclaimer(response, cleaned, org, docs)
             timings["generation_seconds"] = round(time.perf_counter() - t1, 6)
             logger.info("Generation: {:.3f}s | {} chars", timings["generation_seconds"], len(response))
         except Exception as exc:

@@ -1,13 +1,24 @@
+# ── Crawling & Web ──
 crawlee>=1.6.0
 beautifulsoup4>=4.12.0
 httpx>=0.28.0
 requests>=2.32.0
+
+# ── Logging & Config ──
 loguru>=0.7.0
+python-dotenv>=1.0.1
+
+# ── PDF / Document Processing ──
 pdfplumber>=0.11.0
 pymupdf>=1.24.0
 pillow>=10.4.0
+
+# ── Numeric / ML Core ──
 numpy>=1.26.0
-python-dotenv>=1.0.1
+torch>=2.6
+sentence-transformers>=3.0.0
+
+# ── LangChain Stack ──
 jsonpatch==1.33
 langchain-core==1.4.0
 langchain-community==0.4.1
@@ -15,17 +26,27 @@ langchain-huggingface==1.2.1
 langchain-text-splitters==1.1.1
 langchain-ollama==1.1.0
 langchain-openai==1.2.1
+
+# ── Vespa ──
 pyvespa>=0.51.0
+
+# ── Evaluation (RAGAS) ──
 ragas==0.4.3
 datasets>=3.0.0
 pandas>=2.2.0
-sentence-transformers>=3.0.0
-torch>=2.6
+
+# ── Streamlit UI ──
 streamlit>=1.36.0
+
+# ── YouTube / Audio ──
 yt-dlp>=2024.1.1
 youtube-transcript-api>=0.6.0
 openai-whisper>=20231117
+
+# ── Utilities ──
 tqdm>=4.66.0
+
+# ── API (FastAPI) ──
 fastapi>=0.115.0
 uvicorn[standard]>=0.30.0
 SQLAlchemy>=2.0.0
@@ -35,3 +56,4 @@ passlib[bcrypt]>=1.7.4
 python-jose[cryptography]>=3.3.0
 email-validator>=2.2.0
 redis>=5.0.0
+aiofiles>=25.0.0
